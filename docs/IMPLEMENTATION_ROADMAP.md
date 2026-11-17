@@ -49,7 +49,7 @@ Exit criteria: - Auth tests and session security tests pass.
 ### M3 --- Workspace and RBAC
 
 Goal: - Automatic Personal Workspace. - Organization creation. -
-Membership and roles. - Invitations. - Workspace switching API. - Tenant
+Membership and roles (including the Organization Document Permission Policy: Owner/Admin full access to all org documents; Editor full access to own documents and read-only to others'; Member full access only to own documents). - Invitations. - Client-side active workspace selection backed by `GET /api/v1/workspaces` and `GET /api/v1/workspaces/{workspace_id}` with backend membership/permission enforcement on every workspace-scoped request. - Tenant
 isolation tests.
 
 Exit criteria: - Role matrix and cross-tenant tests pass.
@@ -57,8 +57,8 @@ Exit criteria: - Role matrix and cross-tenant tests pass.
 ### M4 --- Credit Engine Foundation
 
 Goal: - Wallets, ledger, reservations. - Atomic
-reserve/commit/release. - Idempotency and reconciliation. -
-Complimentary development credits.
+reserve/commit/release/refund. - Credit commitment only after a valid AI draft is persisted as `review_required` (no second AI charge for DOCX render failures or re-rendering an already approved version). - Idempotency and row-locked stale reservation reconciliation (verifying job liveness before releasing). -
+Configurable complimentary beta credits (backend configuration mechanism; initial configured amount and tariffs remain **TBD**; never hardcode a permanent amount or invent a tariff/price).
 
 Do not enable live payment.
 
@@ -66,24 +66,22 @@ Exit criteria: - Concurrency and idempotency tests pass.
 
 ### M5 --- Document Foundation
 
-Goal: - Document records and versions. - Source records. - Input
-form/raw text models. - Upload intent and validation flow. - Job records
-and state machine.
+Goal: - Document records, versions, and `documents.status` lifecycle (`draft`, `processing`, `review_required`, `approved`, `rendering`, `completed`, `failed`, `archived`). - Source records and workspace-bound `source_bundle_id`. - Input
+form/raw text models. - Document source upload intent (`POST /api/v1/workspaces/{workspace_id}/documents/{document_id}/sources/upload-intents`), upload confirmation/source submission (`POST /api/v1/workspaces/{workspace_id}/documents/{document_id}/sources`), and content validation flow. - Separate asynchronous `jobs` records (`normalize`, `ai_generation`, `docx_render`) and `jobs.status` state machine (human review is never represented as a continuously running job).
 
-Exit criteria: - Structured/raw/hybrid input and tenant tests pass.
+Exit criteria: - Structured/raw/hybrid input, organization document permission policy, and tenant tests pass.
 
 ### M6 --- AI Document Engine
 
 Goal: - Provider abstraction for Gemini. - WorkflowOrchestrator
 interface. - Python fallback adapter. - n8n adapter in local
-development. - Main router and first type-specific workflow. - Pydantic
-result validation and provenance. - Secure callback.
+development. - Signed internal source retrieval (`GET /api/v1/internal/source-bundles/{source_bundle_id}`). - Main router and the approved first vertical slice workflow: `meeting_minutes` (Notulen Rapat). - Pydantic
+result validation, opinion/proposal/decision separation, missing/conflict detection, and provenance. - Secured callbacks (`POST /api/v1/internal/workflows/callback` and `POST /api/v1/internal/workers/callback`) with HMAC-SHA256, 5-minute timestamp tolerance, and `event_id` replay protection.
 
-Start with one document type (recommended: meeting minutes or a simple
-letter), then expand.
+Implement and validate `meeting_minutes` (Notulen Rapat) first. Do not expand implementation to other document types before this slice passes its acceptance criteria.
 
 Exit criteria: - Source-grounding tests pass. - Duplicate/invalid
-callback tests pass. - Fallback adapter works.
+callback and signed source retrieval tests pass. - Fallback adapter works.
 
 ### M7 --- Review and Approval
 
@@ -141,20 +139,26 @@ Do not assume all services are free.
 Exit criteria: - Staging is stable. - Production readiness is explicitly
 approved.
 
-## 3. Recommended First Vertical Slice
+## 3. Approved First Vertical Slice: `meeting_minutes` (Notulen Rapat)
 
-Do not implement all document types simultaneously.
+Do not implement all document types simultaneously. Do not expand implementation to other document types before `meeting_minutes` passes its acceptance criteria.
 
-Recommended first slice: 1. User creates document in Personal Workspace.
-2. User selects a simple letter or meeting-minutes type. 3. User enters
-structured form and text. 4. Backend creates job and reserves
-complimentary test credits. 5. Local n8n workflow or Python fallback
-generates structured draft. 6. FastAPI validates and stores draft. 7.
-User reviews and approves. 8. Worker renders a built-in DOCX template.
-9. User downloads the file.
+The `meeting_minutes` (Notulen Rapat) end-to-end vertical slice must cover:
+1.  **Source input and normalization:** User creates a `meeting_minutes` document and provides form, raw text, and/or supported uploaded files (`DOCX`, `PDF`, `TXT`); Python Worker normalizes uploaded files and reports via `POST /api/v1/internal/workers/callback`.
+2.  **Extraction of meeting information:** FastAPI reserves configurable complimentary test credits, creates the `ai_generation` job and workspace-bound `source_bundle_id`, and dispatches minimal metadata; n8n retrieves normalized sources via `GET /api/v1/internal/source-bundles/{source_bundle_id}` and extracts meeting metadata, attendees, and agenda.
+3.  **Separation of opinions, proposals, and actual decisions:** Never treat a suggestion or opinion as an approved meeting decision unless supported by the source.
+4.  **Identification of action items and responsible persons:** Extract action items, owners, and due dates only when supported by sources.
+5.  **Missing and conflicting information detection:** Flag missing critical fields and conflicting source statements.
+6.  **Source provenance:** Attach provenance references for important extracted fields.
+7.  **Human review and editing:** FastAPI validates the callback (`POST /api/v1/internal/workflows/callback`), persists the draft (`documents.status = review_required`), and commits reserved AI credits; user reviews and edits the draft.
+8.  **Explicit user approval:** User approves the exact draft version/hash (`documents.status = approved`).
+9.  **DOCX rendering using the selected template:** FastAPI creates a `docx_render` job (no second AI charge); Python Worker renders the approved content into the selected template and reports via `POST /api/v1/internal/workers/callback`.
+10. **Download and document history:** User obtains a short-lived signed download URL and views document versions and provenance history.
+
+Never invent meeting decisions, attendees, dates, responsible persons, or action items.
 
 This validates the core product path before adding subscriptions,
-advanced templates, and every document type.
+advanced templates, and additional document types.
 
 ## 4. Local-First Sequence
 

@@ -66,25 +66,20 @@ individuals who regularly prepare formal documents.
 ## 3. Core User Journey
 
 1.  User signs in.
-2.  User selects Personal Workspace or an Organization Workspace.
-3.  User selects a document type.
-4.  User supplies information using a structured form, pasted text,
-    supported files, or a hybrid of these.
-5.  Backend creates a document job and reserves the required credits.
-6.  Input Normalizer prepares source material.
-7.  FastAPI dispatches the job to the configured workflow orchestrator.
-8.  n8n coordinates the AI workflow and Gemini provider.
-9.  The AI result is returned to FastAPI through a secured callback.
-10. FastAPI validates schema, provenance, critical fields, and job
-    identity.
-11. User reviews and edits the draft.
-12. User explicitly approves the content.
-13. Python Worker renders the approved structured content into the
-    selected DOCX template.
-14. The final DOCX is stored privately and made available through a
-    short-lived download URL.
-15. Job usage, credit transactions, document versions, and audit events
-    are recorded.
+2.  User selects Personal Workspace or an Organization Workspace (client-side active workspace selection; backend authorizes every workspace-scoped request).
+3.  User selects a document type (first vertical slice: `meeting_minutes` --- Notulen Rapat).
+4.  User supplies information using a structured form, pasted text, supported files, or a hybrid of these.
+5.  Backend creates a document processing job (`normalize` / `ai_generation`), transitions `documents.status` to `processing`, and atomically reserves the required credits.
+6.  Python Worker (Input Normalizer) prepares and validates uploaded source material and reports completion via an authenticated callback (`POST /api/v1/internal/workers/callback`).
+7.  FastAPI generates or identifies a workspace-bound `source_bundle_id` and dispatches minimal job metadata to the configured workflow orchestrator.
+8.  n8n retrieves normalized source data from FastAPI via a short-lived signed internal endpoint and coordinates the AI workflow and Gemini provider.
+9.  The AI result is returned to FastAPI through a secured callback (`POST /api/v1/internal/workflows/callback`).
+10. FastAPI validates signature, timestamp freshness, replay protection, schema, provenance, critical fields, and job identity, persists the reviewable draft (`documents.status = review_required`), and commits the reserved AI credits.
+11. User reviews and edits the draft (paused in `review_required` document state; no background job stays running during human review).
+12. User explicitly approves the content (`documents.status = approved`).
+13. User requests DOCX generation; FastAPI creates a `docx_render` job (`documents.status = rendering`) without charging a second AI credit, and Python Worker renders the approved structured content into the selected DOCX template.
+14. Python Worker stores the final DOCX privately in R2 and notifies FastAPI via `POST /api/v1/internal/workers/callback`; FastAPI marks the render job and document `completed` and issues short-lived download URLs on authorized request.
+15. Job usage, credit transactions, document versions, and audit events are recorded.
 
 ## 4. Document Types
 
@@ -112,8 +107,18 @@ covers every legal or administrative document type.
 
 ### 4.3 Workflow-specific behavior
 
--   Meeting minutes must distinguish discussion, proposals, decisions,
-    and action items.
+-   Meeting minutes (`meeting_minutes` --- Notulen Rapat) is the approved **first end-to-end vertical slice** to implement and validate before expanding to any other document type. It must cover:
+    1. Source input and normalization.
+    2. Extraction of meeting information.
+    3. Separation of opinions, proposals, and actual decisions.
+    4. Identification of action items and responsible persons when supported by sources.
+    5. Missing and conflicting information detection.
+    6. Source provenance for important extracted fields.
+    7. Human review and editing.
+    8. Explicit user approval.
+    9. DOCX rendering using the selected template.
+    10. Download and document history.
+    Never invent meeting decisions, attendees, dates, responsible persons, or action items.
 -   Reports and LPJ must not invent expenses, participants, outcomes, or
     evidence.
 -   Decision letters must not invent legal bases, official numbers,
@@ -146,47 +151,51 @@ Every user receives a Personal Workspace automatically.
 
 ### 5.3 Roles
 
-  -----------------------------------------------------------------------------
-  Capability               Owner          Admin         Editor           Member
-  --------------- -------------- -------------- -------------- ----------------
-  Full workspace             Yes             No             No               No
-  access                                                       
+  -------------------------------------------------------------------------------------
+  Capability                       Owner          Admin         Editor           Member
+  ----------------------- -------------- -------------- -------------- ----------------
+  Full workspace access              Yes             No             No               No
 
-  Transfer                   Yes             No             No               No
-  ownership                                                    
+  Transfer ownership                 Yes             No             No               No
 
-  Delete                     Yes             No             No               No
-  workspace                                                    
+  Delete workspace                   Yes             No             No               No
 
-  Manage members             Yes    Yes, except             No               No
-                                          Owner                
+  Manage members                     Yes    Yes, except             No               No
+                                                  Owner
 
-  Change roles               Yes    Yes, within             No               No
-  except Owner                           policy                
+  Change roles except                Yes    Yes, within             No               No
+  Owner                                          policy
 
-  Manage                     Yes Yes, permitted             No               No
-  workspace                            settings                
-  settings                                                     
+  Manage workspace                   Yes Yes, permitted             No               No
+  settings                                     settings
 
-  Manage                     Yes            Yes            Yes               No
-  organization                                                 
-  templates                                                    
+  Manage organization                Yes            Yes            Yes               No
+  templates
 
-  Create                     Yes            Yes            Yes              Yes
-  documents                                                    
+  Create documents                   Yes            Yes            Yes              Yes
 
-  Edit own                   Yes            Yes            Yes              Yes
-  documents                                                    
+  Own documents (view,               Yes            Yes            Yes              Yes
+  edit, approve,
+  generate, delete)
 
-  View workspace             Yes            Yes            Yes       Limited or
-  credits/usage                                                  policy-defined
-  -----------------------------------------------------------------------------
+  Other members'                     Yes            Yes      Read-only        No access
+  documents (view, edit,     (full access)  (full access)      (view only)
+  approve, generate,
+  delete)
 
-The exact ability to edit another member's document must be enforced by
-a documented permission policy and is **TBD** before implementation. Do
-not infer permission from frontend visibility.
+  View workspace                     Yes            Yes            Yes       Limited or
+  credits/usage                                                          policy-defined
+  -------------------------------------------------------------------------------------
 
-### 5.4 Membership and invitations
+**Approved Organization Document Permission Policy:**
+-   **Owner:** Full access to all organization documents (view, edit, approve, generate, delete).
+-   **Admin:** Full access to all organization documents (view, edit, approve, generate, delete).
+-   **Editor:** Full access to documents they own; read-only access to other members' documents. Must not edit, approve, generate, or delete documents owned by other members.
+-   **Member:** Full access only to documents they own; no access to other members' documents. Must not view, edit, approve, generate, or delete documents owned by other members.
+
+Backend authorization is authoritative. Never infer permission from frontend visibility.
+
+### 5.4 Membership, invitations, and workspace selection
 
 -   Invitations use single-use random tokens stored as hashes.
 -   Invitations expire.
@@ -194,6 +203,7 @@ not infer permission from frontend visibility.
 -   Acceptance requires the intended email identity to match.
 -   Removing a member does not delete documents created by that member.
 -   Workspace IDs supplied by the client never establish authorization.
+-   Workspace switching is a client-side active workspace selection: the frontend lists accessible workspaces (`GET /api/v1/workspaces`), the user selects an active workspace, and subsequent requests pass the selected `workspace_id`, with FastAPI validating membership and permissions on every request.
 
 ## 6. Credits and Monetization
 
@@ -209,27 +219,27 @@ not infer permission from frontend visibility.
 
 ### 6.2 Credit engine requirements
 
--   Reserve credits before billable processing begins.
--   Use atomic database transactions and locking to prevent
+-   Provide a backend configuration mechanism for complimentary beta credits (do not hardcode a permanent complimentary credit amount; the initial configured amount remains **TBD** until explicitly decided by the Product Owner).
+-   Reserve credits before billable AI processing begins.
+-   Use atomic database transactions and row locking to prevent
     overspending.
 -   Maintain an immutable or append-only transaction ledger.
 -   Make reservation, commit, release, and refund operations idempotent.
 -   Never allow negative balance.
 -   Release reservations on qualifying failures.
 -   Do not commit credits merely because n8n sent a callback.
--   Define success as completion of the billable operation and required
-    validation.
--   If DOCX rendering is included in the tariff, define whether credit
-    commit occurs after validated DOCX storage. Exact tariff and commit
-    boundary are **TBD**.
--   Expose cost estimate before generation.
+-   **Credit Commit Boundary:** Credit commitment occurs **only after a valid AI result has been validated by FastAPI and persisted as a reviewable draft (`documents.status = review_required`)**.
+-   DOCX rendering failures must not cause a second AI charge.
+-   Re-rendering an already approved document version must not incur another AI-generation charge.
+-   **Stranded Reservation Protection:** Reservations must carry an expiration timestamp (`expires_at`) and be covered by idempotent background reconciliation. Reconciliation must never release credits merely because a callback is late; it must verify with row locks that the associated job is genuinely no longer active before releasing or expiring a reservation.
+-   Expose cost estimate before generation (exact credit tariff and monetary pricing remain **TBD**; never invent a tariff or price).
 
 ### 6.3 Monetization status
 
--   Pricing and credit tariffs: **TBD**.
+-   Pricing, credit tariffs, and initial configured complimentary beta credit amount: **TBD** (controlled via backend configuration, never hardcoded as a permanent policy).
 -   Payment provider: Midtrans is a candidate, not a final decision.
 -   Live payments are disabled for initial beta.
--   Use complimentary credits or sandbox testing during development.
+-   Use configurable complimentary credits or sandbox testing during development.
 -   Never trust price or credit quantity sent by the frontend.
 -   Payment eligibility and merchant account requirements must be
     handled lawfully; involve an eligible adult/guardian if a provider
@@ -297,16 +307,11 @@ Examples:
 -   `{{event_date}}`
 -   `{{event_location}}`
 
-Word may split a visible placeholder across multiple XML runs. The
-renderer must either support robust placeholder detection or clearly
-reject unsupported templates during validation.
+Word frequently splits a single visible `{{placeholder}}` across multiple `<w:r>` XML runs during editing. The template validator/renderer must either implement a robust run-normalization pass (merging adjacent XML runs within `{{...}}` delimiters before parsing/rendering) or strictly detect and reject templates with split/unsupported placeholders at upload validation time with a clear actionable error.
 
 ### 8.3 Upload validation
 
-Validate extension, MIME type, magic bytes, size, ZIP structure,
-corruption, expansion ratio, embedded/active content, external
-references, and placeholder syntax. Do not fetch external references
-from uploaded documents.
+Validate extension, MIME type, magic bytes, size, ZIP structure, entry count, uncompressed byte size / expansion ratio (zip-bomb protection), corruption, embedded/active content (macros/OLE), external references, safe XML parsing (disabling DTDs and external entity resolution), and placeholder syntax. Reject malformed files and never fetch external references from uploaded documents. Treat all uploaded files and extracted text as untrusted data.
 
 Initial upload limits: - Maximum 10 MB per file. - Maximum 5 source
 files per document. - Allowed source types: DOCX, PDF, TXT. - Legacy
@@ -402,12 +407,17 @@ See `API_CONTRACT.md` for endpoint details.
   Frontend                Next.js static export   Cloudflare Pages
                                                   target; no SSR, Server
                                                   Actions, middleware, or
-                                                  API routes in static
-                                                  deployment
+                                                  API routes. Dynamic
+                                                  document resolution and
+                                                  auth happen client-side
+                                                  via `/api/v1`
 
-  API                     FastAPI                 Core authority
+  API                     FastAPI                 Core authority and sole
+                                                  owner of PostgreSQL DB
 
-  AI orchestration        n8n adapter             Replaceable; license
+  AI orchestration        n8n adapter             Replaceable; retrieves
+                                                  sources via signed
+                                                  internal API; license
                                                   approval required
                                                   before commercial
                                                   production
@@ -416,7 +426,9 @@ See `API_CONTRACT.md` for endpoint details.
                                                   without n8n
 
   Worker                  Python                  File normalization and
-                                                  DOCX rendering
+                                                  DOCX rendering; reports
+                                                  via signed callback (no
+                                                  direct DB access)
 
   Database                PostgreSQL              Neon Free for early
                                                   development candidate
@@ -432,8 +444,10 @@ See `API_CONTRACT.md` for endpoint details.
 
   Payments                Midtrans candidate      Disabled in beta
 
-  Deployment              Cloudflare Pages +      Validate quotas and
-                          Cloud Run + Neon + R2   costs before production
+  Deployment              Cloudflare Pages +      Requires same
+                          Cloud Run + Neon + R2   registrable domain for
+                                                  cookie/CSRF alignment;
+                                                  validate quotas/costs
   -----------------------------------------------------------------------
 
 Cloud Run requires a billing account and may incur costs outside
@@ -447,14 +461,25 @@ Re-check official pricing and quotas before deployment.
     target).
 -   Opaque random refresh token, stored hashed, rotated and revocable.
 -   Secure, HttpOnly, SameSite cookie policy; CSRF and origin validation
-    for cookie-authenticated endpoints.
+    for cookie-authenticated endpoints. In static frontend deployment
+    (Cloudflare Pages + Cloud Run API), serve frontend and API under the
+    same registrable domain so `HttpOnly` refresh cookies and `Origin`/CSRF
+    protections work without third-party cookie issues.
 -   Workspace isolation enforced in every API and background job.
 -   PostgreSQL RLS may be defense-in-depth, never the sole authorization
     layer.
 -   Private R2 buckets and short-lived signed download URLs.
--   Validate uploads using content signatures, not filename alone.
+-   Validate uploads using content signatures (magic bytes), ZIP entry
+    count and expansion ratio caps, and safe XML parsing, not filename
+    alone.
 -   Avoid SSRF and external-reference fetching.
 -   AI content is untrusted.
+-   Internal service-to-service endpoints (n8n source bundle retrieval,
+    workflow callbacks, and worker callbacks) require HMAC-SHA256
+    signatures (`HMAC-SHA256(secret, "{timestamp}.{event_id}.{METHOD}.{canonical_path}.{raw_body}")`),
+    binding uppercase HTTP method and exact request path (so bodyless `GET` requests never rely on an empty `raw_body` alone),
+    constant-time verification, a 5-minute timestamp tolerance, event ID
+    replay protection, and strict payload size limits.
 -   API keys remain server-side.
 -   Payment webhooks require signature verification, replay protection,
     and idempotency.
@@ -501,8 +526,8 @@ Re-check official pricing and quotas before deployment.
 ## 14. Open Decisions (TBD)
 
 -   Final product name and domain.
--   Final role matrix for editing other members' documents.
--   Credit tariff and exact commit boundary.
+-   Initial configured value for complimentary beta credits (mechanism is configurable in backend; exact number is **TBD**).
+-   Credit tariff per operation and monetary prices (do not invent values).
 -   Subscription plans and prices.
 -   Payment provider and merchant onboarding.
 -   n8n production licensing approval and hosting.
@@ -513,6 +538,7 @@ Re-check official pricing and quotas before deployment.
 -   Retention/deletion policy and legal review.
 -   Supported language/model configuration.
 -   Final upload limits after testing.
+-   Exact ORM/migration and package manager tooling for M1 scaffolding.
 
 ## 15. Definition of MVP Done
 

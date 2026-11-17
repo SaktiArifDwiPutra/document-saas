@@ -18,7 +18,11 @@ Authenticated requests: - `Authorization: Bearer <access_token>` -
 `Content-Type: application/json` where applicable
 
 Cookie-authenticated refresh/logout endpoints require CSRF/origin
-protection.
+protection. In static frontend deployment (Cloudflare Pages + Cloud Run),
+serve the frontend and API under the same registrable domain so
+`HttpOnly`, `Secure`, `SameSite` refresh cookies and `Origin`/CSRF
+protections operate reliably. Dynamic document resolution and
+authorization happen client-side through `/api/v1`.
 
 ### 1.2 Success response
 
@@ -134,7 +138,7 @@ exactly one Personal Workspace.
   ----------------------------------------------------------------------------------------------------------
 
 Rules: - Personal Workspace is created automatically, not through the
-organization creation endpoint. - Only authorized organization roles can
+organization creation endpoint. - **Workspace switching:** Workspace switching is a client-side active workspace selection. The frontend retrieves accessible workspaces via `GET /api/v1/workspaces`, the user selects an active workspace, and subsequent requests pass the selected `workspace_id` (validated by FastAPI for membership and permissions on every workspace-scoped request). No dedicated server-side workspace-switching endpoint is required. - Only authorized organization roles can
 manage members. - Admin cannot transfer ownership or modify the Owner. -
 All endpoints enforce tenant isolation. - Removing a member does not
 delete their documents. - Invitation acceptance validates token hash,
@@ -168,7 +172,7 @@ expiry, unused status, and email match.
   POST                    `/payments/webhooks/midtrans`                       Provider webhook
   ---------------------------------------------------------------------------------------------------
 
-Rules: - Live payments disabled for initial beta. - Backend looks up
+Rules: - Live payments disabled for initial beta. - Complimentary beta credit allocation must be configurable in backend settings (never hardcode a permanent complimentary credit amount; initial configured amount, credit tariffs, and monetary prices remain **TBD** until decided by the Product Owner). - Credit commitment occurs **only after a valid AI result has been persisted as a reviewable draft (`documents.status = review_required`)**. - DOCX rendering failures must not cause a second AI charge, and re-rendering an already approved document version must not incur another AI-generation charge. - Stale reservations are reconciled idempotently only after verifying with row locks that the associated job is genuinely no longer active. - Backend looks up
 price and credits from database. - Verify provider webhook signature. -
 Enforce replay protection and idempotent processing. - Never trust
 frontend payment status or amount. - Do not expose provider secrets. -
@@ -177,47 +181,73 @@ eligibility are resolved.
 
 ## 5. Documents
 
-  ----------------------------------------------------------------------------------------
-  Method                  Endpoint                                 Purpose
-  ----------------------- ---------------------------------------- -----------------------
-  GET                     `/workspaces/{workspace_id}/documents`   List workspace
-                                                                   documents
+  ------------------------------------------------------------------------------------------------------------------------
+  Method                  Endpoint                                                                   Purpose
+  ----------------------- -------------------------------------------------------------------------- ---------------------
+  GET                     `/workspaces/{workspace_id}/documents`                                     List workspace
+                                                                                                     documents
 
-  POST                    `/workspaces/{workspace_id}/documents`   Create document
-                                                                   draft/container
+  POST                    `/workspaces/{workspace_id}/documents`                                     Create document
+                                                                                                     draft/container
 
-  GET                     `/documents/{document_id}`               Get document and
-                                                                   current draft
+  GET                     `/documents/{document_id}`                                                 Get document and
+                                                                                                     current draft
 
-  PATCH                   `/documents/{document_id}`               Update editable
-                                                                   metadata/content under
-                                                                   policy
+  PATCH                   `/documents/{document_id}`                                                 Update editable
+                                                                                                     metadata/content
+                                                                                                     under policy
 
-  DELETE                  `/documents/{document_id}`               Delete/archive document
+  DELETE                  `/documents/{document_id}`                                                 Delete/archive
+                                                                                                     document
 
-  POST                    `/documents/{document_id}/process`       Start normalization and
-                                                                   AI processing
+  POST                    `/workspaces/{workspace_id}/documents/{document_id}/sources/upload-intents` Request presigned
+                                                                                                     upload intent for
+                                                                                                     document source file
 
-  POST                    `/documents/{document_id}/approve`       Approve current draft
-                                                                   version
+  POST                    `/workspaces/{workspace_id}/documents/{document_id}/sources`               Confirm uploaded
+                                                                                                     source file or submit
+                                                                                                     supported text/form
+                                                                                                     input
 
-  POST                    `/documents/{document_id}/generate`      Enqueue DOCX render
+  GET                     `/documents/{document_id}/sources`                                         View
+                                                                                                     source/provenance
+                                                                                                     records
 
-  GET                     `/documents/{document_id}/versions`      List document versions
+  POST                    `/documents/{document_id}/process`                                         Start normalization
+                                                                                                     and AI processing
 
-  GET                     `/documents/{document_id}/download`      Obtain short-lived
-                                                                   download URL
+  POST                    `/documents/{document_id}/approve`                                         Approve current draft
+                                                                                                     version
 
-  GET                     `/documents/{document_id}/sources`       View source/provenance
-                                                                   records
-  ----------------------------------------------------------------------------------------
+  POST                    `/documents/{document_id}/generate`                                        Enqueue DOCX render
 
-Rules: - Every endpoint authorizes current user against workspace
-membership and document policy. - Process endpoint reserves credits
-transactionally. - Approval references the exact current version/hash. -
-Editing after approval invalidates approval. - Generate requires a valid
-approval for the exact version. - Download URL is issued only after
-access check. - Delete behavior and retention are subject to policy.
+  GET                     `/documents/{document_id}/versions`                                        List document
+                                                                                                     versions
+
+  GET                     `/documents/{document_id}/download`                                        Obtain short-lived
+                                                                                                     download URL
+  ------------------------------------------------------------------------------------------------------------------------
+
+*(Note: All endpoints above are mounted under the `/api/v1` base path, e.g., `POST /api/v1/workspaces/{workspace_id}/documents/{document_id}/sources/upload-intents` and `POST /api/v1/workspaces/{workspace_id}/documents/{document_id}/sources`.)*
+
+Rules:
+-   **Organization Document Permission Policy (Authoritative Backend Enforcement):**
+    -   **Owner:** Full access to all organization documents.
+    -   **Admin:** Full access to all organization documents.
+    -   **Editor:** Full access to documents they own; read-only access (`GET`) to other members' documents.
+    -   **Member:** Full access only to documents they own; no access to other members' documents.
+    -   For documents owned by other members, **Editor** and **Member** must not edit, add/confirm sources, process, approve, generate, or delete them. Frontend visibility is never a security boundary.
+-   **Document Source Endpoints (`upload-intents` & `sources`):**
+    -   `POST /api/v1/workspaces/{workspace_id}/documents/{document_id}/sources/upload-intents` authorizes workspace membership and document write permission, validates file count, declared size, and allowed MIME/extension (`DOCX`, `PDF`, `TXT`), and issues a short-lived presigned R2 upload URL with a random object key bound to `(workspace_id, document_id)`.
+    -   `POST /api/v1/workspaces/{workspace_id}/documents/{document_id}/sources` either confirms a completed presigned upload (verifying object ownership in `(workspace_id, document_id)` before scheduling/running content validation) or records structured form/raw text source input.
+-   **Document Lifecycle vs. Job Lifecycle:**
+    -   `documents.status` (`draft`, `processing`, `review_required`, `approved`, `rendering`, `completed`, `failed`, `archived`) is separate from asynchronous `jobs.status` (`queued`, `running`, `validating`, `completed`, `failed`, `cancelled`).
+    -   `POST /documents/{document_id}/process` reserves credits transactionally, sets `documents.status = processing`, and creates asynchronous `normalize` / `ai_generation` job record(s). Reserved AI credits are committed only when a valid AI draft is persisted (`documents.status = review_required`).
+    -   The human review and approval pause (`review_required` -> `approved`) is represented on `documents.status`, never as a continuously running background job.
+-   Approval (`POST /documents/{document_id}/approve`) references the exact current version/hash. Editing after approval creates a new version and invalidates approval.
+-   Generate (`POST /documents/{document_id}/generate`) requires a valid approval for the exact version and creates a `docx_render` job (`documents.status = rendering`) without incurring another AI-generation credit charge.
+-   Download URL is issued only after workspace and document access checks.
+-   Delete behavior and retention are subject to policy.
 
 ## 6. Templates
 
@@ -266,18 +296,20 @@ role. - Published versions are immutable.
 
 ## 7. Upload Protocol
 
+Applies consistently to both document source uploads (`POST /api/v1/workspaces/{workspace_id}/documents/{document_id}/sources/upload-intents` and `POST /api/v1/workspaces/{workspace_id}/documents/{document_id}/sources`) and organization template uploads (`POST /api/v1/templates/upload-intents` and `POST /api/v1/templates/{template_id}/validate`):
+
 1.  Frontend requests an upload intent from FastAPI.
-2.  Backend checks authorization, file count, declared size, and allowed
+2.  Backend checks authorization (workspace membership and document/template write permission), file count, declared size, and allowed
     content type.
 3.  Backend creates a random object key bound to
     workspace/document/template context.
 4.  Backend returns short-lived presigned upload URL and required
     headers.
 5.  Frontend uploads directly to private R2.
-6.  Frontend confirms upload with backend.
-7.  Backend/Worker verifies object existence, size, magic bytes, archive
-    structure, and content safety.
-8.  Only validated objects become usable sources.
+6.  Frontend confirms upload with backend (`POST /api/v1/workspaces/{workspace_id}/documents/{document_id}/sources` for document sources, or template validation endpoint for templates).
+7.  Backend/Worker verifies object existence, workspace/resource ownership, size, magic bytes, archive
+    structure, entry count, expansion ratio (zip-bomb protection), safe XML parsing (disabling external entities/DTDs), and content safety. For templates, also validate or normalize Word XML run-split `{{placeholders}}`.
+8.  Only validated objects become usable sources or template versions; malformed or unsafe files are rejected.
 
 Initial limits: - 10 MB per file. - 5 files per document. - DOCX, PDF,
 TXT. - No arbitrary ZIP or legacy DOC. - Limits are subject to revision
@@ -289,27 +321,29 @@ Never accept a client-supplied object key as proof of ownership.
 
   Method   Endpoint                                     Purpose
   -------- -------------------------------------------- ------------------------------------------
-  GET      `/jobs/{job_id}`                             Get job status and safe progress details
+  GET      `/jobs/{job_id}`                             Get asynchronous job status (`normalize`, `ai_generation`, `docx_render`) and safe progress details
   GET      `/workspaces/{workspace_id}/usage`           Usage events
   GET      `/workspaces/{workspace_id}/usage/summary`   Usage summary
 
-The backend exposes application job state, not raw provider execution
-internals.
+The backend exposes individual asynchronous job state (`jobs.status`), which is distinct from overall document lifecycle state (`documents.status`), and never exposes raw provider execution internals.
 
 ## 9. Internal Service Endpoints
 
-Internal callback endpoints are not public user APIs. They require
-service authentication and strict schemas.
+Internal service endpoints (mounted under `/api/v1`) are not public user APIs. They require short-lived HMAC-SHA256 service authentication and strict schemas.
 
-Possible logical endpoints: - `POST /internal/workflows/callback` -
-`POST /internal/workers/callback`
+Approved internal endpoints:
+-   `GET /api/v1/internal/source-bundles/{source_bundle_id}` (relative: `/internal/source-bundles/{source_bundle_id}`): Used by n8n to retrieve normalized source data bound to the job's workspace and document (`source_bundle_id`). No public unauthenticated source retrieval is allowed.
+-   `POST /api/v1/internal/workflows/callback` (relative: `/internal/workflows/callback`): Used by the workflow orchestrator (n8n / fallback) to report AI workflow completion or failure.
+-   `POST /api/v1/internal/workers/callback` (relative: `/internal/workers/callback`): Used by the Python Worker to report `normalize` and `docx_render` completion or failure. The Worker never connects directly to PostgreSQL.
 
-Exact paths are **TBD**. They must: - Verify HMAC or equivalent service
-identity. - Include timestamp and idempotency/event ID. - Validate job
-state and ownership. - Reject replayed callbacks. - Enforce payload
-size. - Avoid sensitive logging.
+Security and validation requirements:
+-   **Canonical HMAC-SHA256 Signature:** `HMAC-SHA256(secret, "{timestamp}.{event_id}.{METHOD}.{canonical_path}.{raw_body}")` verified using constant-time comparison (`hmac.compare_digest`), binding uppercase HTTP `METHOD`, exact `canonical_path` (including `source_bundle_id` for `GET` source-bundle retrieval), `timestamp`, `event_id`, and exact `raw_body` (`""` for bodyless `GET` requests, never relying on an empty `raw_body` alone).
+-   **Timestamp Freshness:** Reject requests outside a **5-minute (300-second)** tolerance window.
+-   **Replay Protection & Idempotency:** Require a unique `event_id` / idempotency identifier and reject replayed events.
+-   **Context & State Validation:** Verify `job_id`, `source_bundle_id` expiration, workspace/document binding, and permitted job state transitions.
+-   **Payload Bounds & Logging:** Enforce strict payload size limits and never log secrets or unnecessary raw source text.
 
-Do not send end-user access tokens to n8n or Worker.
+Never send end-user login tokens, database credentials, or wallet balances to n8n or Worker.
 
 ## 10. Initial Error Codes
 

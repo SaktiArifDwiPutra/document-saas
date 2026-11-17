@@ -94,12 +94,25 @@ email match.
 ### `documents`
 
 Suggested fields: - `id` - `workspace_id` - `created_by_user_id` -
-`document_type` - `title` - `status` - `current_version_id` -
-`selected_template_version_id` - `approved_version_id` - `created_at` -
+`document_type` - `title` - `status` (`draft`, `processing`, `review_required`, `approved`, `rendering`, `completed`, `failed`, `archived`) - `current_version_id` (nullable) -
+`selected_template_version_id` (nullable; references `template_versions.id`) - `approved_version_id` (nullable) - `created_at` -
 `updated_at` - `deleted_at`
 
 A document belongs to one workspace. Every read/write must authorize
-membership and document-level permissions.
+membership and document-level permissions according to the approved Organization Document Permission Policy:
+-   **Owner:** Full access to all organization documents.
+-   **Admin:** Full access to all organization documents.
+-   **Editor:** Full access to documents they own (`created_by_user_id`); read-only access to other members' documents.
+-   **Member:** Full access only to documents they own (`created_by_user_id`); no access to other members' documents.
+-   For documents owned by other members, **Editor** and **Member** must not edit, approve, generate, or delete them.
+
+**Document Lifecycle vs. Job Lifecycle:**
+`documents.status` tracks the overall document lifecycle across human review (`review_required` -> `approved`), whereas `jobs.status` tracks individual asynchronous tasks (`normalize`, `ai_generation`, `docx_render`). The human review pause is never represented as a continuously running job.
+
+**Circular Relationship (`documents` <-> `document_versions`):**
+Because `documents.current_version_id` and `documents.approved_version_id` reference `document_versions.id` while `document_versions.document_id` references `documents.id`:
+-   `current_version_id` and `approved_version_id` must be nullable.
+-   Migrations must create `documents` first, then `document_versions` (with `document_id REFERENCES documents(id)`), and then add the `current_version_id` and `approved_version_id` foreign key constraints via `ALTER TABLE` (`use_alter=True` / `DEFERRABLE INITIALLY DEFERRED` where appropriate).
 
 ### `document_versions`
 
@@ -109,18 +122,18 @@ nullable for system-generated draft - `created_at` - `approval_status` -
 `approved_by_user_id` - `approved_at`
 
 Do not overwrite approved content in place. Create a new version when
-edits occur.
+edits occur, clear `documents.approved_version_id`, and transition `documents.status` back to `review_required`.
 
 ### `document_sources`
 
-Suggested fields: - `id` - `document_id` - `document_version_id`
-nullable - `source_type` (`form`, `text`, `upload`,
+Suggested fields: - `id` - `workspace_id` - `document_id` - `document_version_id`
+nullable - `source_bundle_id` (nullable UUID grouping normalized sources for a processing run, bound to `workspace_id` and `document_id`) - `source_type` (`form`, `text`, `upload`,
 `workspace_reference`) - `storage_object_key` nullable - `source_name` -
 `extracted_text_reference` or controlled text storage - `content_hash` -
 `metadata` JSONB - `created_at`
 
 Store only what is needed. Apply retention rules to original uploads and
-extracted text.
+extracted text. `source_bundle_id` is used by FastAPI's signed internal endpoint (`GET /api/v1/internal/source-bundles/{source_bundle_id}`) so n8n can retrieve normalized source content with short-lived authorization after workspace and job binding verification.
 
 ### Provenance representation
 
@@ -151,14 +164,17 @@ template version IDs.
 ### `jobs`
 
 Suggested fields: - `id` - `workspace_id` - `document_id` - `job_type`
-(`normalize`, `ai_generation`, `docx_render`) - `status` -
-`workflow_key` - `workflow_version` - `workflow_provider` -
+(`normalize`, `ai_generation`, `docx_render`) - `status` (`queued`, `running`, `validating`, `completed`, `failed`, `cancelled`) -
+`source_bundle_id` (nullable UUID) - `workflow_key` - `workflow_version` - `workflow_provider` -
 `external_execution_id` - `idempotency_key` - `attempt_count` -
 `started_at` - `completed_at` - `error_code` - `safe_error_message` -
 `created_at` - `updated_at`
 
+A document may have multiple `jobs` rows over its lifetime (e.g., a `normalize` job, an `ai_generation` job, and one or more `docx_render` jobs). Only FastAPI reads or writes the `jobs` table; neither n8n nor Python Worker connects directly to PostgreSQL.
+
 Constraints/indexes: - Unique idempotency key within its intended
 scope. - Index `(workspace_id, created_at)`. - Index
+`(document_id, created_at)`. - Index
 `(status, created_at)` for dispatch/recovery. - Index external execution
 identifiers where useful.
 
@@ -172,11 +188,11 @@ Do not store secrets or full source documents in job metadata.
 
 ### `workflow_callback_events`
 
-Suggested fields: - `id` - `job_id` - `event_id` - `event_type` -
+Suggested fields: - `id` - `job_id` - `event_id` - `source_service` (`workflow`, `worker`) - `event_type` (`completed`, `failed`) -
 `received_at` - `signature_valid` - `payload_hash` - `processed_at` -
 `result_status`
 
-Unique event ID prevents replay/duplicate processing.
+Records callbacks received at `POST /api/v1/internal/workflows/callback` and `POST /api/v1/internal/workers/callback`. A unique constraint on `event_id` prevents replay and duplicate processing alongside the 5-minute HMAC-SHA256 timestamp check.
 
 ## 7. Credit and Payment Tables
 
@@ -186,7 +202,7 @@ Suggested fields: - `id` - `workspace_id` (unique) -
 `available_balance` - `reserved_balance` - `updated_at`
 
 Balances may be cached aggregates, but must reconcile to
-ledger/reservation state.
+ledger/reservation state. Complimentary beta credits are allocated via a configurable backend setting (initial configured amount is **TBD**, never hardcoded permanently) and recorded as a `grant` entry in `credit_transactions`.
 
 ### `credit_transactions`
 
@@ -201,12 +217,14 @@ than mutating history.
 
 ### `credit_reservations`
 
-Suggested fields: - `id` - `wallet_id` - `workspace_id` - `job_id` -
+Suggested fields: - `id` - `wallet_id` - `workspace_id` - `job_id` (nullable in M4 until `jobs` table is added in M5) -
 `amount` - `status` (`reserved`, `committed`, `released`, `expired`) -
 `expires_at` - `idempotency_key` - `created_at` - `resolved_at`
 
-A reconciliation process must identify stale reservations. Expiry must
-not silently destroy a valid in-progress job.
+**Commit & Reconciliation Rules:**
+-   Credit commitment (`status = committed` + `commit` ledger entry) occurs **only after a valid AI result has been persisted as a reviewable draft (`documents.status = review_required`)**.
+-   DOCX rendering (`docx_render` job) failures must not cause a second AI charge, and re-rendering an already approved document version must not incur another AI-generation charge.
+-   An idempotent reconciliation process must identify stale reservations (`expires_at < now()`). Reconciliation must acquire row locks (`SELECT ... FOR UPDATE`) and verify that the associated `jobs` record is genuinely no longer active before releasing or expiring a reservation; never release credits merely because a callback is late.
 
 ### `credit_packages`
 
@@ -285,17 +303,21 @@ state transitions and callback idempotency.
 The exact isolation level and lock strategy must be chosen during
 implementation and tested under concurrent requests.
 
-## 11. Migration Order (Proposed)
+## 11. Migration Order (Aligned with Milestones & Foreign Keys)
 
-1.  users and auth sessions
-2.  workspaces and memberships
-3.  invitations
-4.  documents and document versions
-5.  document sources
-6.  templates and template versions
-7.  jobs, attempts, callback events
-8.  credit wallets, transactions, reservations
-9.  payment orders, webhook events, subscriptions
-10. audit logs and usage events
+Every foreign key must reference a table that already exists at that migration step:
 
-This order may change to satisfy foreign-key dependencies.
+1.  **Identity & Sessions (M2):** `users` and `auth_sessions` (`refresh_tokens`).
+2.  **Workspaces & Access (M3):** `workspaces`, `workspace_members`, and `invitations` ( plus `audit_logs` if introduced in M3).
+3.  **Credit Engine Foundation (M4):** `credit_wallets`, `credit_transactions`, `credit_reservations` (with `job_id` defined as a nullable `UUID` column without a foreign key constraint in M4 because `jobs` is introduced in M5), and `credit_packages`.
+4.  **Templates Foundation (M5/M8):** `templates` and `template_versions` (created before `documents` so `documents.selected_template_version_id` can reference `template_versions.id`).
+5.  **Documents & Versions (M5):**
+    -   Create `documents` with `selected_template_version_id REFERENCES template_versions(id)` and nullable `current_version_id` and `approved_version_id` (initially without FK constraints to `document_versions`).
+    -   Create `document_versions` with `document_id REFERENCES documents(id)`.
+    -   Alter `documents` (`ALTER TABLE documents ADD CONSTRAINT ...`) to add foreign keys from `current_version_id` and `approved_version_id` to `document_versions(id)`.
+6.  **Document Sources (M5):** `document_sources` (referencing `workspaces`, `documents`, and `document_versions`, with indexed `source_bundle_id`).
+7.  **Jobs & Callbacks (M5/M6):**
+    -   Create `jobs`, `job_attempts`, and `workflow_callback_events`.
+    -   Alter `credit_reservations` (`ALTER TABLE credit_reservations ADD CONSTRAINT fk_credit_reservations_job_id FOREIGN KEY (job_id) REFERENCES jobs(id)`) now that `jobs` exists.
+8.  **Usage & Audit Telemetry (M6+):** `usage_events` (and `audit_logs` if not already created in M3).
+9.  **Payments & Subscriptions (Deferred / Post-Beta):** `payment_orders`, `payment_webhook_events`, and `subscriptions`.

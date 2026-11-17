@@ -86,18 +86,26 @@ exit status was checked.
 -   Keep routers thin; put business logic in services/use cases.
 -   Use dependency injection for auth, database, storage, AI, and
     orchestration.
--   Centralize permission checks.
+-   Centralize permission checks, enforcing the Organization Document Permission Policy strictly in the backend:
+    -   **Owner / Admin:** Full access to all organization documents.
+    -   **Editor:** Full access to documents they own; read-only access to other members' documents.
+    -   **Member:** Full access only to documents they own; no access to other members' documents.
+    -   For documents owned by other members, **Editor** and **Member** must not edit, approve, generate, or delete them.
+-   Keep complimentary beta credit allocation configurable via backend settings (never hardcode a permanent complimentary credit amount or invent a credit tariff/price; initial values remain **TBD**).
+-   Commit reserved AI credits only after a valid AI result has been persisted as a reviewable draft (`documents.status = review_required`). Never charge a second AI credit for DOCX rendering failures or re-rendering an already approved version.
+-   Keep `documents.status` separate from individual asynchronous `jobs.status` (`normalize`, `ai_generation`, `docx_render`); never represent the human review pause as a continuously running background job.
 -   Use explicit transaction boundaries.
 -   Validate all external inputs.
 -   Use typed request/response schemas.
 -   Do not expose ORM models directly as public API contracts.
--   Do not let n8n or Worker connect to the core database unless a
-    future approved design explicitly requires it.
+-   FastAPI owns core PostgreSQL access. Neither n8n nor Python Worker may connect directly to the core PostgreSQL database.
 
 ### Frontend
 
 -   Frontend is not an authorization boundary.
 -   Do not duplicate business rules as the source of truth.
+-   Use client-side active workspace selection (`GET /api/v1/workspaces` + passing `workspace_id` on workspace-scoped requests).
+-   Respect Next.js static export (`output: 'export'`) rules: no SSR, Server Actions, middleware, or API routes; resolve dynamic documents and permissions client-side via `/api/v1`.
 -   Show real backend states.
 -   Handle loading, empty, error, and permission states.
 -   Avoid fake progress percentages.
@@ -107,14 +115,15 @@ exit status was checked.
 ### Worker
 
 -   Make tasks idempotent.
--   Validate object ownership and expected content.
+-   Validate object ownership and expected content (enforcing archive expansion limits, ZIP entry-count limits, magic-byte inspection, safe XML parsing with DTDs/external entities disabled, malformed-file rejection, and Word XML run-split `{{placeholder}}` handling).
 -   Use bounded memory and processing limits.
 -   Never fetch arbitrary external URLs from document content.
--   Report safe structured outcomes.
+-   Never connect directly to the core PostgreSQL database; report safe structured outcomes to FastAPI via `POST /api/v1/internal/workers/callback`.
 
 ### n8n
 
--   Use versioned workflow keys.
+-   Use versioned workflow keys (implementing `meeting_minutes` --- Notulen Rapat as the first vertical slice before expanding to other document types).
+-   Retrieve normalized source data from FastAPI via `GET /api/v1/internal/source-bundles/{source_bundle_id}` using short-lived signed authorization, and send results to `POST /api/v1/internal/workflows/callback`.
 -   Keep credentials in secure credential storage.
 -   Never embed secrets in exported workflow JSON.
 -   Do not use unreviewed community nodes.
@@ -126,11 +135,11 @@ exit status was checked.
 
 -   Argon2id for password hashing.
 -   Short-lived access tokens and hashed/rotated refresh tokens.
--   CSRF/origin protections for cookie-authenticated endpoints.
+-   CSRF/origin protections and same-registrable-domain deployment alignment for cookie-authenticated endpoints.
 -   Tenant isolation on all reads/writes and background jobs.
 -   Private object storage and short-lived signed URLs.
--   Upload validation based on content, not filename alone.
--   HMAC or equivalent authentication for internal callbacks.
+-   Upload validation based on content signatures, archive expansion/entry caps, and safe XML parsing, not filename alone.
+-   `HMAC-SHA256(secret, "{timestamp}.{event_id}.{METHOD}.{canonical_path}.{raw_body}")` (binding uppercase HTTP method and exact request path so `GET` requests never rely on an empty `raw_body` alone) with constant-time comparison, a 5-minute timestamp tolerance, `event_id` replay protection, and payload size limits for internal source retrieval and callbacks.
 -   Idempotency and replay protection.
 -   Rate limiting for authentication, uploads, and AI processing.
 -   Structured logs without secrets or full document text.
@@ -144,7 +153,7 @@ exit status was checked.
 -   Separate trusted prompt instructions from source content.
 -   AI must not invent missing fields.
 -   Critical values require evidence or explicit user confirmation.
--   Distinguish opinions, proposals, and actual decisions in minutes.
+-   Distinguish opinions, proposals, and actual decisions in minutes (`meeting_minutes`), and never invent meeting decisions, attendees, dates, responsible persons, or action items.
 -   Do not invent expenses, outcomes, participants, legal bases, or
     signatories.
 -   Schema validation does not establish truth.

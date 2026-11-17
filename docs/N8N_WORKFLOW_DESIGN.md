@@ -9,20 +9,21 @@
 n8n coordinates AI document-processing workflows. It is not the SaaS
 backend and must not become the system of record.
 
-FastAPI owns user-facing application state and authorization. Python
-Worker owns technical file operations and DOCX rendering.
+FastAPI owns user-facing application state, authorization, and all core PostgreSQL database access. Python
+Worker owns technical file operations and DOCX rendering, reporting outcomes to FastAPI via `POST /api/v1/internal/workers/callback` without connecting directly to the database.
 
 ## 2. Responsibility Boundaries
 
 ### n8n may
 
--   Receive a minimal job payload from FastAPI.
--   Route to a document-specific workflow.
+-   Receive a minimal job payload from FastAPI (containing `job_id`, `source_bundle_id`, and workflow metadata).
+-   Retrieve normalized source data from FastAPI via a private internal endpoint (`GET /api/v1/internal/source-bundles/{source_bundle_id}`) using short-lived signed authorization.
+-   Route to a document-specific workflow (starting with `meeting_minutes` --- Notulen Rapat as the first vertical slice).
 -   Call Gemini through a controlled provider credential.
 -   Transform and validate intermediate workflow data.
 -   Apply bounded retries for transient provider failures.
 -   Return structured result and safe error details.
--   Send a signed callback to FastAPI.
+-   Send a signed callback to FastAPI (`POST /api/v1/internal/workflows/callback`).
 
 ### n8n may not
 
@@ -32,23 +33,24 @@ Worker owns technical file operations and DOCX rendering.
 -   Create payment orders or confirm payment.
 -   Approve documents.
 -   Directly mutate application database tables.
--   Store end-user access tokens.
+-   Receive or store end-user login/access tokens, database credentials, or wallet balances.
 -   Decide that a document is final/approved.
 -   Bypass FastAPI result validation.
+-   Log unnecessary raw source content in execution history.
 
 ## 3. Workflow Keys
 
 Initial logical workflow keys:
 
 -   `document_generation_v1` --- main entry and router.
--   `letter_workflow_v1` --- letters and invitations.
--   `proposal_workflow_v1` --- proposals.
--   `meeting_minutes_v1` --- meeting minutes.
--   `report_workflow_v1` --- reports and LPJ.
+-   `meeting_minutes_v1` --- meeting minutes (`meeting_minutes` --- Notulen Rapat; **approved first end-to-end vertical slice**).
+-   `letter_workflow_v1` --- letters and invitations (implemented only after `meeting_minutes_v1` passes acceptance criteria).
+-   `proposal_workflow_v1` --- proposals (subsequent slice).
+-   `report_workflow_v1` --- reports and LPJ (subsequent slice).
 -   `document_error_handler_v1` --- standardized failure handling.
 
 These keys are logical identifiers. Actual n8n workflow IDs and JSON
-exports are created during implementation.
+exports are created during implementation. Do not expand implementation to other document types before `meeting_minutes` passes its acceptance criteria.
 
 ## 4. Main Workflow
 
@@ -57,11 +59,12 @@ flowchart TD
     A[Receive dispatch payload] --> B[Validate required fields]
     B --> C{Workflow key supported?}
     C -- No --> E[Build safe failure event]
-    C -- Yes --> D[Route by document type]
+    C -- Yes --> S[Fetch normalized sources via signed internal API]
+    S --> D[Route by document type]
     D --> F[Call type-specific workflow]
     F --> G[Normalize structured result]
     G --> H[Build callback event]
-    H --> I[Send callback to FastAPI]
+    H --> I[Send signed callback to FastAPI]
     I --> J[End]
     E --> I
 ```
@@ -69,9 +72,9 @@ flowchart TD
 The backend remains responsible for final schema, provenance, state, and
 business validation.
 
-## 5. Minimal Dispatch Payload
+## 5. Minimal Dispatch Payload and Signed Internal Source Retrieval
 
-Illustrative shape only; finalize exact schema before implementation:
+Illustrative dispatch payload shape; finalize exact schema before implementation:
 
 ``` json
 {
@@ -81,10 +84,11 @@ Illustrative shape only; finalize exact schema before implementation:
   "workflow_version": "1",
   "document_type": "meeting_minutes",
   "input_reference": {
-    "source_bundle_id": "uuid"
+    "source_bundle_id": "uuid",
+    "retrieval_endpoint": "/api/v1/internal/source-bundles/{source_bundle_id}"
   },
   "callback": {
-    "event_endpoint": "configured-internal-endpoint"
+    "event_endpoint": "/api/v1/internal/workflows/callback"
   },
   "issued_at": "ISO-8601 timestamp"
 }
@@ -92,12 +96,15 @@ Illustrative shape only; finalize exact schema before implementation:
 
 Do not include: - User password or session token. - Access or refresh
 tokens. - Wallet balance or payment credentials. - Unnecessary personal
-data. - Database credentials. - Long-lived object-storage credentials.
+data. - Database credentials. - Long-lived object-storage credentials. - Raw source text inline in the dispatch payload.
 
-If source text must be supplied, use the minimum required content or a
-short-lived backend-controlled retrieval mechanism. The choice is
-**TBD** and must consider privacy, payload size, and n8n execution-data
-retention.
+### Signed Internal Source Retrieval (`source_bundle_id`)
+
+1.  **FastAPI Pre-Dispatch Validation:** Before dispatching, FastAPI validates user authentication, workspace access, organization document permissions, and credit reservation; creates and persists the durable `ai_generation` job; and generates or identifies a workspace-bound `source_bundle_id`.
+2.  **`source_bundle_id` Lifecycle & Workspace Binding:** Each `source_bundle_id` is bound to a specific `(workspace_id, document_id, job_id)` context in PostgreSQL and expires after a short-lived window tied to the job execution attempt.
+3.  **Authenticated Retrieval:** n8n retrieves normalized source data from `GET /api/v1/internal/source-bundles/{source_bundle_id}` using short-lived HMAC-SHA256 signed headers. No public unauthenticated source retrieval is permitted.
+4.  **Verification & Replay Protection:** FastAPI verifies the HMAC-SHA256 signature (`HMAC-SHA256(secret, "{timestamp}.{event_id}.{METHOD}.{canonical_path}.{raw_body}")`, binding `METHOD="GET"`, exact `canonical_path="/api/v1/internal/source-bundles/{source_bundle_id}"`, `timestamp`, `event_id`, and `raw_body=""`) with constant-time comparison, enforces a **5-minute (300-second)** timestamp tolerance, checks `event_id` replay protection, verifies that the `source_bundle_id` has not expired and matches the active job's workspace, and enforces response/payload size bounds.
+5.  **Execution Log Hygiene:** n8n workflows must avoid persisting unnecessary raw source content in execution logs.
 
 ## 6. Type-Specific Workflow Requirements
 
@@ -116,13 +123,25 @@ retention.
     supplied by the user.
 -   Do not invent partners, approvals, or commitments.
 
-### 6.3 Meeting Minutes
+### 6.3 Meeting Minutes (`meeting_minutes` --- First Vertical Slice)
 
-Represent separately: - Meeting metadata. - Attendees and absentees. -
-Agenda. - Discussion points. - Proposals/opinions. - Actual decisions. -
-Action items, owners, and due dates.
+`meeting_minutes` (Notulen Rapat) is the first end-to-end document workflow to implement and validate.
 
-A suggestion is not a decision unless the source confirms it.
+The end-to-end workflow and application slice must cover:
+1.  Source input and normalization.
+2.  Extraction of meeting information (metadata, attendees, absentees, agenda).
+3.  Separation of opinions, proposals, and actual decisions.
+4.  Identification of action items, responsible persons, and due dates when supported by sources.
+5.  Missing and conflicting information detection.
+6.  Source provenance for important extracted fields.
+7.  Human review and editing.
+8.  Explicit user approval.
+9.  DOCX rendering using the selected template.
+10. Download and document history.
+
+Strict grounding rules:
+-   Never invent meeting decisions, attendees, dates, responsible persons, or action items.
+-   A suggestion or opinion is not a decision unless the source confirms it.
 
 ### 6.4 Reports and LPJ
 
@@ -151,20 +170,22 @@ Critical field support. - Permitted job state transition.
 
 ## 8. Callback Contract and Security
 
-Callback should contain: - Unique event ID. - Job ID. -
+Workflow callbacks are sent to `POST /api/v1/internal/workflows/callback` (and Python Worker callbacks are sent to `POST /api/v1/internal/workers/callback`).
+
+Callback payload and headers must contain: - Unique event ID (`event_id`). - Job ID (`job_id`). -
 Attempt/idempotency key. - Event type (`completed` or `failed`). -
-Timestamp. - Structured result or safe error. - HMAC signature.
+Timestamp (`timestamp`). - Structured result or safe error. - HMAC-SHA256 signature.
 
-Security controls: 1. HMAC over a canonical request body and timestamp.
-2. Secret stored in a secure credential store/environment. 3. Timestamp
-freshness check. 4. Replay detection using unique event ID. 5.
-Constant-time signature comparison. 6. Payload size cap. 7. Callback
-idempotency. 8. FastAPI validates job state before processing. 9. Rotate
-secrets without exposing them in workflow exports. 10. Do not log source
-text or secrets.
-
-Exact signature format and key rotation procedure are **TBD** before
-implementation.
+Security controls:
+1.  **Canonical Signature Format:** `HMAC-SHA256(secret, "{timestamp}.{event_id}.{METHOD}.{canonical_path}.{raw_body}")` (binding uppercase HTTP method, exact request path, timestamp, `event_id`, and raw body; `""` for bodyless `GET` requests).
+2.  **Secret Storage:** Secret stored in a secure credential store/environment (never embedded in exported workflow JSON).
+3.  **Timestamp Freshness:** Reject requests outside a **5-minute (300-second)** tolerance window.
+4.  **Replay Protection:** Reject replayed or duplicate requests using unique `event_id` persistence (`workflow_callback_events`).
+5.  **Constant-Time Verification:** Compare HMAC signatures using constant-time digest comparison (`hmac.compare_digest`).
+6.  **Payload Size Cap:** Enforce strict maximum payload size limits.
+7.  **Idempotency & Job State Validation:** FastAPI validates that `job_id` is in an active state that accepts the transition and processes retries idempotently.
+8.  **Credit Commit Boundary:** FastAPI commits reserved AI credits only after the callback is verified, the output schema and provenance are validated, and the reviewable draft is persisted (`documents.status = review_required`).
+9.  **Secret Rotation & Log Hygiene:** Support secret rotation (procedure **TBD** in implementation design) and never log raw source text or secrets.
 
 ## 9. Retries and Failure Handling
 
