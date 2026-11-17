@@ -1,7 +1,9 @@
 """Application configuration and environment validation."""
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
+from urllib.parse import quote
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -9,6 +11,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 EnvironmentName = Literal["local", "test", "staging", "production"]
 
 _PLACEHOLDER_PREFIXES = ("replace-with-", "changeme", "placeholder", "example")
+_DEFAULT_PLACEHOLDER_DB_PASSWORD = "replace-with-local-dev-password"
+_BACKEND_DIR = Path(__file__).resolve().parents[2]
+_BACKEND_ENV_FILE = _BACKEND_DIR / ".env"
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_ROOT_ENV_FILE = _REPO_ROOT / ".env"
 
 
 def _looks_like_placeholder(value: str) -> bool:
@@ -20,7 +27,7 @@ class Settings(BaseSettings):
     """Runtime settings validated at startup."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(str(_ROOT_ENV_FILE), str(_BACKEND_ENV_FILE)),
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
@@ -31,8 +38,14 @@ class Settings(BaseSettings):
     environment: EnvironmentName = "local"
     api_v1_prefix: str = "/api/v1"
 
+    postgres_user: str = "document_saas"
+    postgres_password: str = _DEFAULT_PLACEHOLDER_DB_PASSWORD
+    postgres_db: str = "document_saas_dev"
+    postgres_host: str = "localhost"
+    postgres_port: int = Field(default=5432, ge=1, le=65535)
+
     database_url: str = (
-        "postgresql+asyncpg://document_saas:replace-with-local-dev-password"
+        f"postgresql+asyncpg://document_saas:{_DEFAULT_PLACEHOLDER_DB_PASSWORD}"
         "@localhost:5432/document_saas_dev"
     )
 
@@ -60,7 +73,20 @@ class Settings(BaseSettings):
         return value
 
     @model_validator(mode="after")
-    def validate_non_local_security(self) -> "Settings":
+    def sync_and_validate_security(self) -> "Settings":
+        # If DATABASE_URL still contains the default template placeholder password while
+        # POSTGRES_PASSWORD was configured in .env, derive the matching PostgreSQL URL.
+        if _DEFAULT_PLACEHOLDER_DB_PASSWORD in self.database_url and not _looks_like_placeholder(
+            self.postgres_password
+        ):
+            encoded_user = quote(self.postgres_user, safe="")
+            encoded_password = quote(self.postgres_password, safe="")
+            encoded_db = quote(self.postgres_db, safe="")
+            self.database_url = (
+                f"postgresql+asyncpg://{encoded_user}:{encoded_password}"
+                f"@{self.postgres_host}:{self.postgres_port}/{encoded_db}"
+            )
+
         if self.environment in ("staging", "production"):
             if _looks_like_placeholder(self.internal_hmac_secret):
                 raise ValueError(
