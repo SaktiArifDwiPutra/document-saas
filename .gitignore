@@ -1,0 +1,35 @@
+# Environment files (never commit real credentials or local secrets)
+.env
+.env.*
+!.env.example
+!**/.env.example
+
+# Python virtual environments & caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node.js / Next.js / Frontend artifacts
+node_modules/
+frontend/.next/
+frontend/out/
+frontend/next-env.d.ts
+frontend/coverage/
+frontend/playwright-report/
+frontend/test-results/
+*.tsbuildinfo
+.pnpm-store/
+
+# Local development data & OS/Editor junk
+.local-data/
+.DS_Store
+*.swp
+*.swo
