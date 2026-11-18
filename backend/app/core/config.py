@@ -85,9 +85,18 @@ class Settings(BaseSettings):
     rate_limit_forgot_account_max: int = Field(default=3, ge=1)
     rate_limit_forgot_account_window_seconds: int = Field(default=3600, ge=10)
 
-    # Configurable beta complimentary credits; exact initial amount remains TBD by Product Owner.
+    # Configurable beta complimentary credits and AI generation cost; exact values remain TBD.
     beta_complimentary_credits: int | None = Field(default=None, ge=0)
+    ai_generation_credit_cost: int | None = Field(default=None, ge=1)
     credit_reservation_ttl_seconds: int = Field(default=900, ge=60, le=86400)
+
+    # M5 upload & archive safety limits (10 MB per file, max 5 files per document).
+    max_source_files_per_document: int = Field(default=5, ge=1, le=50)
+    max_upload_file_size_bytes: int = Field(default=10 * 1024 * 1024, ge=1024)
+    max_archive_expansion_ratio: int = Field(default=10, ge=1, le=100)
+    max_zip_entries: int = Field(default=1000, ge=1, le=10000)
+    object_storage_endpoint: str = "https://r2.local.invalid"
+    object_storage_bucket: str = "document-saas-private"
 
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
 

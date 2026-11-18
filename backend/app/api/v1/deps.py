@@ -15,17 +15,25 @@ from app.db.session import get_db_session
 from app.models.auth import User
 from app.services.auth import AuthService
 from app.services.credit import CreditService
+from app.services.document import DocumentService
 from app.services.email import EmailService, StubEmailService
+from app.services.storage import InMemoryObjectStorage, ObjectStorageService
 from app.services.workspace import WorkspaceService
 
 _bearer_scheme = HTTPBearer(auto_error=False)
 _default_email_service = StubEmailService()
+_default_object_storage = InMemoryObjectStorage()
 _default_rate_limiter: SlidingWindowRateLimiter | None = None
 
 
 def get_email_service() -> EmailService:
     """Return configured transactional email service (stub in local/test)."""
     return _default_email_service
+
+
+def get_object_storage() -> ObjectStorageService:
+    """Return configured private object storage service (in-memory in local/test)."""
+    return _default_object_storage
 
 
 def get_rate_limiter(
@@ -77,6 +85,15 @@ def get_credit_service(
 ) -> CreditService:
     """Construct CreditService with injected DB session and settings."""
     return CreditService(session=session, settings=settings)
+
+
+def get_document_service(
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    storage: Annotated[ObjectStorageService, Depends(get_object_storage)],
+) -> DocumentService:
+    """Construct DocumentService with injected DB session, settings, and storage."""
+    return DocumentService(session=session, settings=settings, storage=storage)
 
 
 async def get_current_user(

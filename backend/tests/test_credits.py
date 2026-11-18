@@ -628,7 +628,7 @@ async def test_concurrent_credit_reservations_and_commits_on_pg(
                         workspace_id=ws_id,
                         amount=3,
                         idempotency_key=f"pg-conc-{idx}",
-                        job_id=uuid4(),
+                        job_id=None,
                         created_by_user_id=user_id,
                     )
                 except AppError as exc:

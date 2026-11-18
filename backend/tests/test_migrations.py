@@ -62,7 +62,7 @@ def test_alembic_baseline_upgrade_and_downgrade(tmp_path: Path) -> None:
     alembic_cfg.set_main_option("sqlalchemy.url", async_url)
 
     script_dir = ScriptDirectory.from_config(alembic_cfg)
-    assert script_dir.get_heads() == ["0004_m4_credit_engine"]
+    assert script_dir.get_heads() == ["0005_m5_document_foundation"]
 
     command.upgrade(alembic_cfg, "head")
 
@@ -82,6 +82,14 @@ def test_alembic_baseline_upgrade_and_downgrade(tmp_path: Path) -> None:
             "credit_transactions",
             "credit_reservations",
             "credit_packages",
+            "templates",
+            "template_versions",
+            "documents",
+            "document_versions",
+            "document_sources",
+            "jobs",
+            "job_attempts",
+            "workflow_callback_events",
         }.issubset(tables)
     sync_engine.dispose()
 
@@ -133,7 +141,7 @@ def test_alembic_baseline_upgrade_and_downgrade_postgresql(tmp_path: Path) -> No
 
         command.upgrade(alembic_cfg, "head")
         assert asyncio.run(_fetch_alembic_versions(test_db_url)) == [
-            "0004_m4_credit_engine"
+            "0005_m5_document_foundation"
         ]
         pg_tables = asyncio.run(_fetch_pg_tables(test_db_url))
         assert {
@@ -149,6 +157,14 @@ def test_alembic_baseline_upgrade_and_downgrade_postgresql(tmp_path: Path) -> No
             "credit_transactions",
             "credit_reservations",
             "credit_packages",
+            "templates",
+            "template_versions",
+            "documents",
+            "document_versions",
+            "document_sources",
+            "jobs",
+            "job_attempts",
+            "workflow_callback_events",
         }.issubset(pg_tables)
 
         command.downgrade(alembic_cfg, "base")
@@ -166,6 +182,14 @@ def test_alembic_baseline_upgrade_and_downgrade_postgresql(tmp_path: Path) -> No
             "credit_transactions",
             "credit_reservations",
             "credit_packages",
+            "templates",
+            "template_versions",
+            "documents",
+            "document_versions",
+            "document_sources",
+            "jobs",
+            "job_attempts",
+            "workflow_callback_events",
         }.isdisjoint(pg_tables_after)
     finally:
         subprocess.run(

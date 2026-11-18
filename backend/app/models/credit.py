@@ -130,8 +130,12 @@ class CreditReservation(Base):
         index=True,
         nullable=False,
     )
-    # Nullable UUID without FK in M4 because `jobs` is introduced in M5.
-    job_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True, nullable=True)
+    job_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("jobs.id", ondelete="SET NULL"),
+        index=True,
+        nullable=True,
+    )
     amount: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
