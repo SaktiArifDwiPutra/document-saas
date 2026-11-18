@@ -28,7 +28,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-CSRF-Token"],
     )
 
-    register_exception_handlers(application)
+    register_exception_handlers(application, resolved_settings)
     if settings is not None:
         application.dependency_overrides[get_settings] = lambda: resolved_settings
     application.include_router(api_v1_router, prefix=resolved_settings.api_v1_prefix)

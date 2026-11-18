@@ -165,3 +165,21 @@ def test_rate_limit_per_scope_capacity_configuration() -> None:
 
     with pytest.raises(ValidationError):
         Settings(environment="local", rate_limit_login_account_max_keys=0)
+
+
+def test_cors_origins_defaults_and_normalization() -> None:
+    """Local CORS origins default to localhost/127.0.0.1:3000 and normalize trailing slashes."""
+    default_settings = Settings(environment="local")
+    assert default_settings.cors_origins == [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+
+    normalized = Settings(
+        environment="local",
+        cors_origins=["  https://app.example.com/  ", "http://localhost:3000///", "   "],
+    )
+    assert normalized.cors_origins == [
+        "https://app.example.com",
+        "http://localhost:3000",
+    ]

@@ -112,7 +112,19 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-2.5-flash"
     gemini_timeout_seconds: float = Field(default=30.0, ge=1.0, le=120.0)
 
-    cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
+    cors_origins: list[str] = Field(
+        default_factory=lambda: ["http://localhost:3000", "http://127.0.0.1:3000"]
+    )
+
+    @field_validator("cors_origins")
+    @classmethod
+    def normalize_cors_origins(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for origin in value:
+            cleaned = origin.strip().rstrip("/")
+            if cleaned:
+                normalized.append(cleaned)
+        return normalized
 
     @field_validator("api_v1_prefix")
     @classmethod
