@@ -111,10 +111,7 @@ scoped to `Path=/api/v1/auth`, while the readable `csrf_token` cookie uses
 single-flight refresh coalescing and logout/refresh generation sequencing
 coordinate concurrent calls within a single browser tab; cross-tab refresh
 coordination (e.g., `BroadcastChannel` or `navigator.locks`) is explicitly
-deferred as a known production-readiness limitation. - Register transaction creates
-user and exactly one Personal Workspace (Personal Workspace creation deferred
-to M3). - M2 uses a stub transactional email service; real email provider
-integration remains a separate task before production launch.
+deferred as a known production-readiness limitation. - Register transaction creates user and exactly one Personal Workspace. - M2 uses a stub transactional email service; real email provider integration remains a separate task before production launch.
 
 ## 3. Workspaces
 

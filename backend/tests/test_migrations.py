@@ -62,14 +62,23 @@ def test_alembic_baseline_upgrade_and_downgrade(tmp_path: Path) -> None:
     alembic_cfg.set_main_option("sqlalchemy.url", async_url)
 
     script_dir = ScriptDirectory.from_config(alembic_cfg)
-    assert script_dir.get_heads() == ["0002_m2_auth_identity_sessions"]
+    assert script_dir.get_heads() == ["0003_m3_workspaces_rbac"]
 
     command.upgrade(alembic_cfg, "head")
 
     sync_engine = create_engine(sync_url)
     with sync_engine.connect() as conn:
         tables = set(inspect(conn).get_table_names())
-        assert {"alembic_version", "users", "auth_sessions", "auth_action_tokens"}.issubset(tables)
+        assert {
+            "alembic_version",
+            "users",
+            "auth_sessions",
+            "auth_action_tokens",
+            "workspaces",
+            "workspace_members",
+            "invitations",
+            "audit_logs",
+        }.issubset(tables)
     sync_engine.dispose()
 
     command.downgrade(alembic_cfg, "base")
@@ -120,17 +129,32 @@ def test_alembic_baseline_upgrade_and_downgrade_postgresql(tmp_path: Path) -> No
 
         command.upgrade(alembic_cfg, "head")
         assert asyncio.run(_fetch_alembic_versions(test_db_url)) == [
-            "0002_m2_auth_identity_sessions"
+            "0003_m3_workspaces_rbac"
         ]
         pg_tables = asyncio.run(_fetch_pg_tables(test_db_url))
-        assert {"alembic_version", "users", "auth_sessions", "auth_action_tokens"}.issubset(
-            pg_tables
-        )
+        assert {
+            "alembic_version",
+            "users",
+            "auth_sessions",
+            "auth_action_tokens",
+            "workspaces",
+            "workspace_members",
+            "invitations",
+            "audit_logs",
+        }.issubset(pg_tables)
 
         command.downgrade(alembic_cfg, "base")
         assert asyncio.run(_fetch_alembic_versions(test_db_url)) == []
         pg_tables_after = asyncio.run(_fetch_pg_tables(test_db_url))
-        assert {"users", "auth_sessions", "auth_action_tokens"}.isdisjoint(pg_tables_after)
+        assert {
+            "users",
+            "auth_sessions",
+            "auth_action_tokens",
+            "workspaces",
+            "workspace_members",
+            "invitations",
+            "audit_logs",
+        }.isdisjoint(pg_tables_after)
     finally:
         subprocess.run(
             [str(pg_ctl_bin), "-D", str(pg_data), "stop", "-m", "immediate"],

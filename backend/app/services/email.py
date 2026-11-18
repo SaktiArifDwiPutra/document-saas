@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Literal, Protocol
 
-EmailTemplate = Literal["verify_email", "password_reset"]
+EmailTemplate = Literal["verify_email", "password_reset", "workspace_invitation"]
 
 
 @dataclass(frozen=True)
@@ -15,6 +15,7 @@ class OutboxEmail:
     template: EmailTemplate
     token: str
     sent_at: datetime
+    metadata: dict[str, str] = field(default_factory=dict)
 
 
 class EmailService(Protocol):
@@ -26,6 +27,17 @@ class EmailService(Protocol):
 
     async def send_password_reset_email(self, *, to_email: str, token: str) -> None:
         """Send a password reset link/token."""
+        ...
+
+    async def send_workspace_invitation_email(
+        self,
+        *,
+        to_email: str,
+        token: str,
+        workspace_name: str,
+        role: str,
+    ) -> None:
+        """Send an organization workspace invitation token."""
         ...
 
 
@@ -55,5 +67,23 @@ class StubEmailService:
                 template="password_reset",
                 token=token,
                 sent_at=datetime.now(UTC),
+            )
+        )
+
+    async def send_workspace_invitation_email(
+        self,
+        *,
+        to_email: str,
+        token: str,
+        workspace_name: str,
+        role: str,
+    ) -> None:
+        self.sent_messages.append(
+            OutboxEmail(
+                to_email=to_email,
+                template="workspace_invitation",
+                token=token,
+                sent_at=datetime.now(UTC),
+                metadata={"workspace_name": workspace_name, "role": role},
             )
         )

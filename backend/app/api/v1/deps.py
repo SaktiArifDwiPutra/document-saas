@@ -15,6 +15,7 @@ from app.db.session import get_db_session
 from app.models.auth import User
 from app.services.auth import AuthService
 from app.services.email import EmailService, StubEmailService
+from app.services.workspace import WorkspaceService
 
 _bearer_scheme = HTTPBearer(auto_error=False)
 _default_email_service = StubEmailService()
@@ -58,6 +59,15 @@ def get_auth_service(
 ) -> AuthService:
     """Construct AuthService with injected DB session, settings, and email provider."""
     return AuthService(session=session, settings=settings, email_service=email_service)
+
+
+def get_workspace_service(
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    email_service: Annotated[EmailService, Depends(get_email_service)],
+) -> WorkspaceService:
+    """Construct WorkspaceService with injected DB session, settings, and email provider."""
+    return WorkspaceService(session=session, settings=settings, email_service=email_service)
 
 
 async def get_current_user(

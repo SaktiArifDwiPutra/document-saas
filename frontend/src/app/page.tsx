@@ -12,7 +12,7 @@ export default function HomePage() {
         className="rounded-lg border border-slate-200 bg-white p-8 shadow-sm"
       >
         <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-          Milestone M2 — Autentikasi &amp; Fondasi
+          Milestone M3 — Workspace &amp; RBAC
         </p>
         <h1
           id="foundation-heading"
@@ -48,6 +48,12 @@ export default function HomePage() {
             className="rounded-md border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
           >
             Daftar Akun
+          </Link>
+          <Link
+            href="/workspaces"
+            className="rounded-md border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
+          >
+            Kelola Workspace
           </Link>
         </div>
       </section>

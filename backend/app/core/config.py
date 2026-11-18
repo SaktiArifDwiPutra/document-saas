@@ -61,6 +61,7 @@ class Settings(BaseSettings):
     refresh_token_expire_days: int = Field(default=14, ge=1, le=90)
     email_verification_expire_hours: int = Field(default=24, ge=1, le=168)
     password_reset_expire_minutes: int = Field(default=60, ge=5, le=240)
+    workspace_invitation_expire_hours: int = Field(default=168, ge=1, le=720)
     cookie_secure: bool = False
     cookie_samesite: Literal["lax", "strict", "none"] = "lax"
     require_origin_or_referer: bool = True

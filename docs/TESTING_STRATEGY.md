@@ -57,7 +57,7 @@ organization members according to role.
 
 ### 3.1 Authentication
 
--   Registration creates user and Personal Workspace (Personal Workspace creation deferred to M3).
+-   Registration creates user and Personal Workspace.
 -   Duplicate normalized email rejected.
 -   Password hash is not plaintext; Argon2id constant-time dummy verification runs on nonexistent accounts and outdated hashes rehash transparently on login.
 -   Dual per-IP and SHA-256 hashed per-account rate limiting (plus independent per-scope capacity pools, expired-bucket pruning before rejection, non-eviction of active buckets, fail-closed HTTP 429 saturation behavior and availability trade-offs, and PII-free saturation logging/metrics), noting in-memory scope is single-instance dev/beta only.

@@ -20,6 +20,7 @@ from app.core.security import (
     verify_password_constant_time,
 )
 from app.models.auth import AuthActionToken, AuthSession, User
+from app.models.workspace import Workspace, WorkspaceMember
 from app.schemas.auth import AuthTokenResponse, UserProfileResponse
 from app.services.email import EmailService
 
@@ -193,6 +194,23 @@ class AuthService:
                 message="Email sudah terdaftar.",
                 status_code=409,
             ) from exc
+
+        personal_workspace = Workspace(
+            name=f"Workspace Pribadi - {user.display_name}"[:120],
+            type="personal",
+            owner_user_id=user.id,
+            status="active",
+        )
+        self._session.add(personal_workspace)
+        await self._session.flush()
+        self._session.add(
+            WorkspaceMember(
+                workspace_id=personal_workspace.id,
+                user_id=user.id,
+                role="owner",
+                status="active",
+            )
+        )
 
         verification_token = await self._create_action_token(
             user_id=user.id,
