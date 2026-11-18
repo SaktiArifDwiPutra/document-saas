@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 DocumentType = Literal["meeting_minutes"]
 DocumentStatus = Literal[
@@ -22,6 +22,8 @@ SourceType = Literal["form", "text", "upload", "workspace_reference"]
 SourceValidationStatus = Literal["pending", "valid", "rejected"]
 JobType = Literal["normalize", "ai_generation", "docx_render"]
 JobStatus = Literal["queued", "running", "validating", "completed", "failed", "cancelled"]
+ReviewFieldStatus = Literal["grounded", "user_provided", "missing", "conflicting"]
+ReviewItemOrigin = Literal["grounded", "user_provided"]
 
 
 def _strip_non_empty(value: str, field_label: str) -> str:
@@ -46,12 +48,146 @@ class DocumentCreateRequest(BaseModel):
         return _strip_non_empty(value, "Judul dokumen")
 
 
+class ReviewProvenanceEntry(BaseModel):
+    """Source attribution entry stored on reviewed document versions."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    field_path: str = Field(min_length=1, max_length=120)
+    source_id: UUID
+    source_name: str = Field(min_length=1, max_length=255)
+    source_type: SourceType
+    excerpt: str = Field(min_length=1, max_length=500)
+
+
+class ReviewConflictItem(BaseModel):
+    """Detected source conflict preserved during human review until explicitly resolved."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    field_path: str = Field(min_length=1, max_length=120)
+    values: list[str] = Field(min_length=2, max_length=20)
+    source_ids: list[UUID] = Field(min_length=1, max_length=20)
+    description: str = Field(min_length=1, max_length=500)
+
+
+class ReviewOpinionItem(BaseModel):
+    """Reviewed meeting opinion item supporting AI-grounded or user-provided origin."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    statement: str = Field(min_length=1, max_length=1000)
+    speaker: str | None = Field(default=None, max_length=120)
+    origin: ReviewItemOrigin = "user_provided"
+    source_id: UUID | None = None
+    excerpt: str | None = Field(default=None, max_length=500)
+
+    @field_validator("statement")
+    @classmethod
+    def validate_statement(cls, value: str) -> str:
+        """Require non-blank opinion statement."""
+        return _strip_non_empty(value, "Pernyataan opini")
+
+
+class ReviewProposalItem(BaseModel):
+    """Reviewed meeting proposal item supporting AI-grounded or user-provided origin."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    proposal: str = Field(min_length=1, max_length=1000)
+    proposer: str | None = Field(default=None, max_length=120)
+    status: Literal["proposed", "deferred"] = "proposed"
+    origin: ReviewItemOrigin = "user_provided"
+    source_id: UUID | None = None
+    excerpt: str | None = Field(default=None, max_length=500)
+
+    @field_validator("proposal")
+    @classmethod
+    def validate_proposal(cls, value: str) -> str:
+        """Require non-blank proposal description."""
+        return _strip_non_empty(value, "Isi usulan")
+
+
+class ReviewDecisionItem(BaseModel):
+    """Reviewed meeting decision item supporting AI-grounded or user-provided origin."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision: str = Field(min_length=1, max_length=1000)
+    origin: ReviewItemOrigin = "user_provided"
+    source_id: UUID | None = None
+    excerpt: str | None = Field(default=None, max_length=500)
+
+    @field_validator("decision")
+    @classmethod
+    def validate_decision(cls, value: str) -> str:
+        """Require non-blank decision text."""
+        return _strip_non_empty(value, "Isi keputusan")
+
+
+class ReviewActionItem(BaseModel):
+    """Reviewed action item supporting AI-grounded or user-provided origin."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    task: str = Field(min_length=1, max_length=1000)
+    assignee: str | None = Field(default=None, max_length=120)
+    due_date: str | None = Field(default=None, max_length=64)
+    origin: ReviewItemOrigin = "user_provided"
+    source_id: UUID | None = None
+    excerpt: str | None = Field(default=None, max_length=500)
+
+    @field_validator("task")
+    @classmethod
+    def validate_task(cls, value: str) -> str:
+        """Require non-blank action task text."""
+        return _strip_non_empty(value, "Tugas tindak lanjut")
+
+
+class MeetingMinutesReviewContent(BaseModel):
+    """Human-reviewable Notulen Rapat structured content schema separate from M6 AI callbacks."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    meeting_title: str | None = Field(default=None, max_length=255)
+    meeting_date: str | None = Field(default=None, max_length=64)
+    meeting_time: str | None = Field(default=None, max_length=64)
+    location: str | None = Field(default=None, max_length=255)
+    organizer: str | None = Field(default=None, max_length=255)
+    chairperson: str | None = Field(default=None, max_length=120)
+    attendees: list[str] = Field(default_factory=list, max_length=200)
+    absentees: list[str] = Field(default_factory=list, max_length=200)
+    agenda_items: list[str] = Field(default_factory=list, max_length=200)
+    discussion_summary: str | None = Field(default=None, max_length=10_000)
+    opinions: list[ReviewOpinionItem] = Field(default_factory=list, max_length=100)
+    proposals: list[ReviewProposalItem] = Field(default_factory=list, max_length=100)
+    decisions: list[ReviewDecisionItem] = Field(default_factory=list, max_length=100)
+    action_items: list[ReviewActionItem] = Field(default_factory=list, max_length=100)
+    field_statuses: dict[str, ReviewFieldStatus] = Field(default_factory=dict)
+    conflicts: list[ReviewConflictItem] = Field(default_factory=list, max_length=50)
+    provenance: list[ReviewProvenanceEntry] = Field(default_factory=list, max_length=300)
+    warnings: list[str] = Field(default_factory=list, max_length=50)
+
+
+class DocumentReviewReadiness(BaseModel):
+    """Authoritative approval readiness and blocking validation summary for a draft version."""
+
+    is_ready_for_approval: bool
+    missing_required_fields: list[str]
+    unresolved_conflict_fields: list[str]
+    blocking_issues: list[str]
+    optional_warnings: list[str]
+
+
 class DocumentUpdateRequest(BaseModel):
     """Payload to update editable document metadata or structured content."""
 
     title: str | None = Field(default=None, min_length=1, max_length=255)
     structured_content: dict[str, object] | None = None
     selected_template_version_id: UUID | None = None
+    expected_version_id: UUID | None = None
+    expected_content_hash: str | None = Field(default=None, min_length=64, max_length=64)
+    resolved_conflict_fields: list[str] = Field(default_factory=list, max_length=50)
 
     @field_validator("title")
     @classmethod
@@ -60,6 +196,15 @@ class DocumentUpdateRequest(BaseModel):
         if value is None:
             return None
         return _strip_non_empty(value, "Judul dokumen")
+
+
+class ApproveDocumentRequest(BaseModel):
+    """Explicit human approval payload bound to an exact document version and content hash."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    version_id: UUID
+    content_hash: str = Field(min_length=64, max_length=64)
 
 
 class UploadIntentRequest(BaseModel):
@@ -218,11 +363,12 @@ class DocumentSummaryResponse(BaseModel):
 
 
 class DocumentDetailResponse(DocumentSummaryResponse):
-    """Document detail including current version snapshot, source count, and jobs."""
+    """Document detail including current version snapshot, source count, jobs, and readiness."""
 
     current_version: DocumentVersionResponse | None
     sources_count: int
     jobs: list[JobResponse]
+    review_readiness: DocumentReviewReadiness | None = None
 
 
 class DocumentListResponse(BaseModel):

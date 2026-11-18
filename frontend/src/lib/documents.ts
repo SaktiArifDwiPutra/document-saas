@@ -17,6 +17,16 @@ export type SourceType = "form" | "text" | "upload" | "workspace_reference";
 export type SourceValidationStatus = "pending" | "valid" | "rejected";
 export type JobType = "normalize" | "ai_generation" | "docx_render";
 export type JobStatus = "queued" | "running" | "validating" | "completed" | "failed" | "cancelled";
+export type ReviewFieldStatus = "grounded" | "user_provided" | "missing" | "conflicting";
+export type ReviewItemOrigin = "grounded" | "user_provided";
+
+export interface DocumentReviewReadiness {
+  is_ready_for_approval: boolean;
+  missing_required_fields: string[];
+  unresolved_conflict_fields: string[];
+  blocking_issues: string[];
+  optional_warnings: string[];
+}
 
 export interface DocumentVersionData {
   id: string;
@@ -85,6 +95,7 @@ export interface DocumentDetailData extends DocumentSummaryData {
   current_version: DocumentVersionData | null;
   sources_count: number;
   jobs: JobData[];
+  review_readiness?: DocumentReviewReadiness | null;
 }
 
 export interface DocumentListData {
@@ -224,6 +235,9 @@ export async function updateDocument(
     title?: string | null;
     structured_content?: Record<string, unknown> | null;
     selected_template_version_id?: string | null;
+    expected_version_id?: string | null;
+    expected_content_hash?: string | null;
+    resolved_conflict_fields?: string[];
   },
 ): Promise<DocumentDetailData> {
   const res = await fetch(`${getApiBaseUrl()}/documents/${encodeURIComponent(documentId)}`, {
@@ -234,6 +248,28 @@ export async function updateDocument(
     },
     body: JSON.stringify(payload),
   });
+  return parseApiResponse<DocumentDetailData>(res);
+}
+
+export async function approveDocument(
+  accessToken: string,
+  documentId: string,
+  payload: {
+    version_id: string;
+    content_hash: string;
+  },
+): Promise<DocumentDetailData> {
+  const res = await fetch(
+    `${getApiBaseUrl()}/documents/${encodeURIComponent(documentId)}/approve`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    },
+  );
   return parseApiResponse<DocumentDetailData>(res);
 }
 
@@ -360,29 +396,33 @@ export interface MeetingMinutesDraftContent {
   opinions: Array<{
     statement: string;
     speaker: string | null;
-    source_id: string;
-    excerpt: string;
+    origin?: ReviewItemOrigin;
+    source_id: string | null;
+    excerpt: string | null;
   }>;
   proposals: Array<{
     proposal: string;
     proposer: string | null;
     status: "proposed" | "deferred";
-    source_id: string;
-    excerpt: string;
+    origin?: ReviewItemOrigin;
+    source_id: string | null;
+    excerpt: string | null;
   }>;
   decisions: Array<{
     decision: string;
-    source_id: string;
-    excerpt: string;
+    origin?: ReviewItemOrigin;
+    source_id: string | null;
+    excerpt: string | null;
   }>;
   action_items: Array<{
     task: string;
     assignee: string | null;
     due_date: string | null;
-    source_id: string;
-    excerpt: string;
+    origin?: ReviewItemOrigin;
+    source_id: string | null;
+    excerpt: string | null;
   }>;
-  field_statuses: Record<string, "grounded" | "missing" | "conflicting">;
+  field_statuses: Record<string, ReviewFieldStatus>;
   conflicts: ConflictItem[];
   provenance: Array<{
     field_path: string;
@@ -392,6 +432,322 @@ export interface MeetingMinutesDraftContent {
     excerpt: string;
   }>;
   warnings: string[];
+}
+
+function asNullableString(val: unknown): string | null {
+  return typeof val === "string" ? val : null;
+}
+
+function asStringArray(val: unknown): string[] {
+  if (!Array.isArray(val)) {
+    return [];
+  }
+  return val.filter((item): item is string => typeof item === "string");
+}
+
+function resolveItemOrigin(
+  rawOrigin: unknown,
+  sourceId: string | null,
+  excerpt: string | null,
+): ReviewItemOrigin {
+  if (rawOrigin === "grounded" || rawOrigin === "user_provided") {
+    return rawOrigin;
+  }
+  return sourceId && excerpt ? "grounded" : "user_provided";
+}
+
+export function normalizeDraftForEditor(
+  raw: Record<string, unknown> | null | undefined,
+): MeetingMinutesDraftContent {
+  const data = raw ?? {};
+  const rawOpinions = Array.isArray(data.opinions) ? data.opinions : [];
+  const rawProposals = Array.isArray(data.proposals) ? data.proposals : [];
+  const rawDecisions = Array.isArray(data.decisions) ? data.decisions : [];
+  const rawActions = Array.isArray(data.action_items) ? data.action_items : [];
+  const rawConflicts = Array.isArray(data.conflicts) ? data.conflicts : [];
+  const rawProvenance = Array.isArray(data.provenance) ? data.provenance : [];
+  const rawStatuses =
+    data.field_statuses && typeof data.field_statuses === "object"
+      ? (data.field_statuses as Record<string, unknown>)
+      : {};
+
+  const field_statuses: Record<string, ReviewFieldStatus> = {};
+  for (const [k, v] of Object.entries(rawStatuses)) {
+    if (v === "grounded" || v === "user_provided" || v === "missing" || v === "conflicting") {
+      field_statuses[k] = v;
+    }
+  }
+
+  return {
+    meeting_title: asNullableString(data.meeting_title),
+    meeting_date: asNullableString(data.meeting_date),
+    meeting_time: asNullableString(data.meeting_time),
+    location: asNullableString(data.location),
+    organizer: asNullableString(data.organizer),
+    chairperson: asNullableString(data.chairperson),
+    attendees: asStringArray(data.attendees),
+    absentees: asStringArray(data.absentees),
+    agenda_items: asStringArray(data.agenda_items),
+    discussion_summary: asNullableString(data.discussion_summary),
+    opinions: rawOpinions
+      .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object"))
+      .map((item) => {
+        const sourceId = asNullableString(item.source_id);
+        const excerpt = asNullableString(item.excerpt);
+        return {
+          statement: typeof item.statement === "string" ? item.statement : "",
+          speaker: asNullableString(item.speaker),
+          origin: resolveItemOrigin(item.origin, sourceId, excerpt),
+          source_id: sourceId,
+          excerpt,
+        };
+      }),
+    proposals: rawProposals
+      .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object"))
+      .map((item) => {
+        const sourceId = asNullableString(item.source_id);
+        const excerpt = asNullableString(item.excerpt);
+        return {
+          proposal: typeof item.proposal === "string" ? item.proposal : "",
+          proposer: asNullableString(item.proposer),
+          status: item.status === "deferred" ? "deferred" : "proposed",
+          origin: resolveItemOrigin(item.origin, sourceId, excerpt),
+          source_id: sourceId,
+          excerpt,
+        };
+      }),
+    decisions: rawDecisions
+      .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object"))
+      .map((item) => {
+        const sourceId = asNullableString(item.source_id);
+        const excerpt = asNullableString(item.excerpt);
+        return {
+          decision: typeof item.decision === "string" ? item.decision : "",
+          origin: resolveItemOrigin(item.origin, sourceId, excerpt),
+          source_id: sourceId,
+          excerpt,
+        };
+      }),
+    action_items: rawActions
+      .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object"))
+      .map((item) => {
+        const sourceId = asNullableString(item.source_id);
+        const excerpt = asNullableString(item.excerpt);
+        return {
+          task: typeof item.task === "string" ? item.task : "",
+          assignee: asNullableString(item.assignee),
+          due_date: asNullableString(item.due_date),
+          origin: resolveItemOrigin(item.origin, sourceId, excerpt),
+          source_id: sourceId,
+          excerpt,
+        };
+      }),
+    field_statuses,
+    conflicts: rawConflicts.filter(
+      (item): item is ConflictItem =>
+        Boolean(
+          item &&
+            typeof item === "object" &&
+            typeof (item as ConflictItem).field_path === "string" &&
+            Array.isArray((item as ConflictItem).values),
+        ),
+    ),
+    provenance: rawProvenance.filter(
+      (item): item is MeetingMinutesDraftContent["provenance"][number] =>
+        Boolean(
+          item &&
+            typeof item === "object" &&
+            typeof item.field_path === "string" &&
+            typeof item.source_id === "string" &&
+            typeof item.excerpt === "string",
+        ),
+    ),
+    warnings: asStringArray(data.warnings),
+  };
+}
+
+function isFieldNonEmptyInDraft(draft: MeetingMinutesDraftContent, fieldPath: string): boolean {
+  switch (fieldPath) {
+    case "meeting_title":
+      return Boolean(draft.meeting_title?.trim());
+    case "meeting_date":
+      return Boolean(draft.meeting_date?.trim());
+    case "meeting_time":
+      return Boolean(draft.meeting_time?.trim());
+    case "location":
+      return Boolean(draft.location?.trim());
+    case "organizer":
+      return Boolean(draft.organizer?.trim());
+    case "chairperson":
+      return Boolean(draft.chairperson?.trim());
+    case "discussion_summary":
+      return Boolean(draft.discussion_summary?.trim());
+    case "attendees":
+      return draft.attendees.some((x) => x.trim().length > 0);
+    case "absentees":
+      return draft.absentees.some((x) => x.trim().length > 0);
+    case "agenda_items":
+      return draft.agenda_items.some((x) => x.trim().length > 0);
+    case "opinions":
+      return draft.opinions.length > 0;
+    case "proposals":
+      return draft.proposals.length > 0;
+    case "decisions":
+      return draft.decisions.length > 0;
+    case "action_items":
+      return draft.action_items.length > 0;
+    default:
+      return false;
+  }
+}
+
+export function evaluateClientReviewReadiness(
+  draft: MeetingMinutesDraftContent | null,
+  resolvedConflictFields: string[] = [],
+): DocumentReviewReadiness {
+  if (!draft) {
+    return {
+      is_ready_for_approval: false,
+      missing_required_fields: [
+        "meeting_title",
+        "meeting_date",
+        "attendees",
+        "agenda_items",
+        "content_sections",
+      ],
+      unresolved_conflict_fields: [],
+      blocking_issues: ["Draf dokumen belum tersedia untuk ditinjau."],
+      optional_warnings: [],
+    };
+  }
+
+  const missing_required_fields: string[] = [];
+  const blocking_issues: string[] = [];
+
+  if (!draft.meeting_title?.trim()) {
+    missing_required_fields.push("meeting_title");
+    blocking_issues.push("Judul rapat wajib diisi sebelum persetujuan.");
+  }
+  if (!draft.meeting_date?.trim()) {
+    missing_required_fields.push("meeting_date");
+    blocking_issues.push("Tanggal rapat wajib diisi sebelum persetujuan.");
+  }
+  if (!draft.attendees.some((x) => x.trim().length > 0)) {
+    missing_required_fields.push("attendees");
+    blocking_issues.push("Daftar peserta hadir wajib memiliki minimal satu peserta.");
+  }
+  if (!draft.agenda_items.some((x) => x.trim().length > 0)) {
+    missing_required_fields.push("agenda_items");
+    blocking_issues.push("Agenda rapat wajib memiliki minimal satu topik.");
+  }
+
+  const hasSummary = Boolean(draft.discussion_summary?.trim());
+  const hasDecisions = draft.decisions.some((d) => d.decision.trim().length > 0);
+  const hasActions = draft.action_items.some((a) => a.task.trim().length > 0);
+  if (!hasSummary && !hasDecisions && !hasActions) {
+    missing_required_fields.push("content_sections");
+    blocking_issues.push(
+      "Minimal satu bagian isi rapat (ringkasan pembahasan, keputusan, atau tindak lanjut) wajib diisi.",
+    );
+  }
+
+  const resolvedSet = new Set(resolvedConflictFields);
+  const unresolved_conflict_fields: string[] = [];
+  const seenConflicts = new Set<string>();
+
+  const maybeAddConflict = (fieldPath: string) => {
+    if (seenConflicts.has(fieldPath)) {
+      return;
+    }
+    const isResolved = resolvedSet.has(fieldPath) && isFieldNonEmptyInDraft(draft, fieldPath);
+    if (!isResolved) {
+      seenConflicts.add(fieldPath);
+      unresolved_conflict_fields.push(fieldPath);
+      blocking_issues.push(`Konflik pada bidang '${fieldPath}' wajib diselesaikan terlebih dahulu.`);
+    }
+  };
+
+  for (const conflict of draft.conflicts) {
+    maybeAddConflict(conflict.field_path);
+  }
+  for (const [fieldName, status] of Object.entries(draft.field_statuses)) {
+    if (status === "conflicting") {
+      maybeAddConflict(fieldName);
+    }
+  }
+
+  const optional_warnings: string[] = [];
+  const seenWarnings = new Set<string>();
+  for (const w of draft.warnings) {
+    const cleaned = w.trim();
+    if (cleaned && !seenWarnings.has(cleaned)) {
+      seenWarnings.add(cleaned);
+      optional_warnings.push(cleaned);
+    }
+  }
+  if (!draft.meeting_time?.trim()) {
+    optional_warnings.push("Waktu rapat belum diisi (opsional).");
+  }
+  if (!draft.location?.trim()) {
+    optional_warnings.push("Lokasi rapat belum diisi (opsional).");
+  }
+  if (!draft.organizer?.trim()) {
+    optional_warnings.push("Penyelenggara rapat belum diisi (opsional).");
+  }
+  if (!draft.chairperson?.trim()) {
+    optional_warnings.push("Pimpinan rapat belum diisi (opsional).");
+  }
+  if (!hasDecisions) {
+    optional_warnings.push("Tidak ada keputusan formal tercatat pada rapat ini (opsional).");
+  }
+  if (draft.action_items.some((a) => !a.assignee?.trim() || !a.due_date?.trim())) {
+    optional_warnings.push("Beberapa tindak lanjut belum memiliki PIC atau tenggat waktu (opsional).");
+  }
+
+  return {
+    is_ready_for_approval:
+      missing_required_fields.length === 0 && unresolved_conflict_fields.length === 0,
+    missing_required_fields,
+    unresolved_conflict_fields,
+    blocking_issues,
+    optional_warnings,
+  };
+}
+
+export function computeDraftDirtySignature(
+  draft: MeetingMinutesDraftContent | null,
+  resolvedConflictFields: string[],
+  title: string,
+): string {
+  if (!draft) {
+    return JSON.stringify({ title: title.trim(), draft: null });
+  }
+  return JSON.stringify({
+    title: title.trim(),
+    resolved: [...new Set(resolvedConflictFields)].sort(),
+    meeting_title: draft.meeting_title ?? null,
+    meeting_date: draft.meeting_date ?? null,
+    meeting_time: draft.meeting_time ?? null,
+    location: draft.location ?? null,
+    organizer: draft.organizer ?? null,
+    chairperson: draft.chairperson ?? null,
+    attendees: draft.attendees,
+    absentees: draft.absentees,
+    agenda_items: draft.agenda_items,
+    discussion_summary: draft.discussion_summary ?? null,
+    opinions: draft.opinions.map((o) => ({ statement: o.statement, speaker: o.speaker })),
+    proposals: draft.proposals.map((p) => ({
+      proposal: p.proposal,
+      proposer: p.proposer,
+      status: p.status,
+    })),
+    decisions: draft.decisions.map((d) => ({ decision: d.decision })),
+    action_items: draft.action_items.map((a) => ({
+      task: a.task,
+      assignee: a.assignee,
+      due_date: a.due_date,
+    })),
+  });
 }
 
 export interface UsageEventItem {

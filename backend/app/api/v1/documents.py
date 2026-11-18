@@ -19,6 +19,7 @@ from app.core.config import Settings, get_settings
 from app.core.errors import ApiResponse
 from app.models.auth import User
 from app.schemas.document import (
+    ApproveDocumentRequest,
     DeleteDocumentResponse,
     DocumentCreateRequest,
     DocumentDetailResponse,
@@ -242,6 +243,25 @@ async def process_document(
             document_id=document_id,
             source_bundle_id=data.source_bundle_id,
         )
+    return ApiResponse(data=data)
+
+
+@documents_router.post(
+    "/documents/{document_id}/approve",
+    response_model=ApiResponse[DocumentDetailResponse],
+)
+async def approve_document(
+    document_id: UUID,
+    payload: ApproveDocumentRequest,
+    current_user: Annotated[User, Depends(get_current_user)],
+    document_service: Annotated[DocumentService, Depends(get_document_service)],
+) -> ApiResponse[DocumentDetailResponse]:
+    """Explicitly approve the exact current draft version after precondition checks."""
+    data = await document_service.approve_document(
+        current_user,
+        document_id=document_id,
+        payload=payload,
+    )
     return ApiResponse(data=data)
 
 

@@ -2,10 +2,13 @@
 
 import hashlib
 import json
+from collections import Counter
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import cast
 from uuid import UUID, uuid4
 
+from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -39,10 +42,12 @@ from app.models.document import (
 from app.models.workspace import Workspace, WorkspaceMember
 from app.schemas.document import (
     ApprovalStatus,
+    ApproveDocumentRequest,
     DeleteDocumentResponse,
     DocumentCreateRequest,
     DocumentDetailResponse,
     DocumentListResponse,
+    DocumentReviewReadiness,
     DocumentSourceListResponse,
     DocumentSourceResponse,
     DocumentSourceSubmitRequest,
@@ -55,8 +60,16 @@ from app.schemas.document import (
     JobStatus,
     JobType,
     MeetingMinutesFormInput,
+    MeetingMinutesReviewContent,
     ProcessDocumentRequest,
     ProcessDocumentResponse,
+    ReviewActionItem,
+    ReviewConflictItem,
+    ReviewDecisionItem,
+    ReviewFieldStatus,
+    ReviewOpinionItem,
+    ReviewProposalItem,
+    ReviewProvenanceEntry,
     SourceType,
     SourceValidationStatus,
     UploadIntentRequest,
@@ -74,6 +87,193 @@ _PROCESSABLE_DOC_STATUSES: frozenset[str] = frozenset({"draft", "failed", "revie
 _IMMUTABLE_WHILE_ACTIVE_STATUSES: frozenset[str] = frozenset(
     {"processing", "rendering", "archived"}
 )
+_REVIEW_SCALAR_FIELDS: tuple[str, ...] = (
+    "meeting_title",
+    "meeting_date",
+    "meeting_time",
+    "location",
+    "organizer",
+    "chairperson",
+    "discussion_summary",
+)
+_REVIEW_SIMPLE_LIST_FIELDS: tuple[str, ...] = ("attendees", "absentees", "agenda_items")
+_REVIEW_COMPLEX_LIST_FIELDS: tuple[str, ...] = (
+    "opinions",
+    "proposals",
+    "decisions",
+    "action_items",
+)
+_ALL_REVIEW_CONTENT_FIELDS: frozenset[str] = frozenset(
+    _REVIEW_SCALAR_FIELDS + _REVIEW_SIMPLE_LIST_FIELDS + _REVIEW_COMPLEX_LIST_FIELDS
+)
+_REVIEW_SCHEMA_KEYS: frozenset[str] = frozenset(MeetingMinutesReviewContent.model_fields.keys())
+
+
+def _clean_optional_str(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    return cleaned if cleaned else None
+
+
+def _clean_string_list(items: Sequence[str]) -> list[str]:
+    return [item.strip() for item in items if item.strip()]
+
+
+def _provenance_matches_field(field_path: str, target_field: str) -> bool:
+    return (
+        field_path == target_field
+        or field_path.startswith(f"{target_field}[")
+        or field_path.startswith(f"{target_field}.")
+    )
+
+
+def _content_fields_signature(parsed: MeetingMinutesReviewContent) -> dict[str, object]:
+    """Return canonical content-only payload ignoring provenance/status metadata."""
+    return {
+        "meeting_title": _clean_optional_str(parsed.meeting_title),
+        "meeting_date": _clean_optional_str(parsed.meeting_date),
+        "meeting_time": _clean_optional_str(parsed.meeting_time),
+        "location": _clean_optional_str(parsed.location),
+        "organizer": _clean_optional_str(parsed.organizer),
+        "chairperson": _clean_optional_str(parsed.chairperson),
+        "attendees": _clean_string_list(parsed.attendees),
+        "absentees": _clean_string_list(parsed.absentees),
+        "agenda_items": _clean_string_list(parsed.agenda_items),
+        "discussion_summary": _clean_optional_str(parsed.discussion_summary),
+        "opinions": [
+            (item.statement.strip(), _clean_optional_str(item.speaker))
+            for item in parsed.opinions
+        ],
+        "proposals": [
+            (item.proposal.strip(), _clean_optional_str(item.proposer), item.status)
+            for item in parsed.proposals
+        ],
+        "decisions": [item.decision.strip() for item in parsed.decisions],
+        "action_items": [
+            (
+                item.task.strip(),
+                _clean_optional_str(item.assignee),
+                _clean_optional_str(item.due_date),
+            )
+            for item in parsed.action_items
+        ],
+    }
+
+
+def evaluate_meeting_minutes_readiness(
+    content: dict[str, object] | None,
+) -> DocumentReviewReadiness:
+    """Evaluate mandatory approval preconditions vs. optional informational warnings."""
+    if content is None:
+        return DocumentReviewReadiness(
+            is_ready_for_approval=False,
+            missing_required_fields=[
+                "meeting_title",
+                "meeting_date",
+                "attendees",
+                "agenda_items",
+                "content_sections",
+            ],
+            unresolved_conflict_fields=[],
+            blocking_issues=["Draf dokumen belum tersedia untuk ditinjau."],
+            optional_warnings=[],
+        )
+
+    try:
+        parsed = MeetingMinutesReviewContent.model_validate(content)
+    except ValidationError:
+        return DocumentReviewReadiness(
+            is_ready_for_approval=False,
+            missing_required_fields=[
+                "meeting_title",
+                "meeting_date",
+                "attendees",
+                "agenda_items",
+                "content_sections",
+            ],
+            unresolved_conflict_fields=[],
+            blocking_issues=["Struktur draf Notulen Rapat belum lengkap."],
+            optional_warnings=[],
+        )
+
+    missing_required_fields: list[str] = []
+    blocking_issues: list[str] = []
+
+    if _clean_optional_str(parsed.meeting_title) is None:
+        missing_required_fields.append("meeting_title")
+        blocking_issues.append("Judul rapat wajib diisi sebelum persetujuan.")
+    if _clean_optional_str(parsed.meeting_date) is None:
+        missing_required_fields.append("meeting_date")
+        blocking_issues.append("Tanggal rapat wajib diisi sebelum persetujuan.")
+    if not _clean_string_list(parsed.attendees):
+        missing_required_fields.append("attendees")
+        blocking_issues.append("Daftar peserta hadir wajib memiliki minimal satu peserta.")
+    if not _clean_string_list(parsed.agenda_items):
+        missing_required_fields.append("agenda_items")
+        blocking_issues.append("Agenda rapat wajib memiliki minimal satu topik.")
+
+    has_summary = _clean_optional_str(parsed.discussion_summary) is not None
+    has_decisions = len(parsed.decisions) > 0
+    has_actions = len(parsed.action_items) > 0
+    if not (has_summary or has_decisions or has_actions):
+        missing_required_fields.append("content_sections")
+        blocking_issues.append(
+            "Minimal satu bagian isi rapat (ringkasan pembahasan, keputusan, "
+            "atau tindak lanjut) wajib diisi."
+        )
+
+    unresolved_conflict_fields: list[str] = []
+    seen_conflicts: set[str] = set()
+    for conflict in parsed.conflicts:
+        if conflict.field_path not in seen_conflicts:
+            seen_conflicts.add(conflict.field_path)
+            unresolved_conflict_fields.append(conflict.field_path)
+    for field_name, status in parsed.field_statuses.items():
+        if status == "conflicting" and field_name not in seen_conflicts:
+            seen_conflicts.add(field_name)
+            unresolved_conflict_fields.append(field_name)
+
+    for conflict_field in unresolved_conflict_fields:
+        blocking_issues.append(
+            f"Konflik pada bidang '{conflict_field}' wajib diselesaikan terlebih dahulu."
+        )
+
+    optional_warnings: list[str] = []
+    seen_warnings: set[str] = set()
+    for warning in parsed.warnings:
+        cleaned_warning = warning.strip()
+        if cleaned_warning and cleaned_warning not in seen_warnings:
+            seen_warnings.add(cleaned_warning)
+            optional_warnings.append(cleaned_warning)
+
+    if _clean_optional_str(parsed.meeting_time) is None:
+        optional_warnings.append("Waktu rapat belum diisi (opsional).")
+    if _clean_optional_str(parsed.location) is None:
+        optional_warnings.append("Lokasi rapat belum diisi (opsional).")
+    if _clean_optional_str(parsed.organizer) is None:
+        optional_warnings.append("Penyelenggara rapat belum diisi (opsional).")
+    if _clean_optional_str(parsed.chairperson) is None:
+        optional_warnings.append("Pimpinan rapat belum diisi (opsional).")
+    if not parsed.decisions:
+        optional_warnings.append("Tidak ada keputusan formal tercatat pada rapat ini (opsional).")
+    if any(
+        _clean_optional_str(item.assignee) is None or _clean_optional_str(item.due_date) is None
+        for item in parsed.action_items
+    ):
+        optional_warnings.append(
+            "Beberapa tindak lanjut belum memiliki PIC atau tenggat waktu (opsional)."
+        )
+
+    return DocumentReviewReadiness(
+        is_ready_for_approval=(
+            len(missing_required_fields) == 0 and len(unresolved_conflict_fields) == 0
+        ),
+        missing_required_fields=missing_required_fields,
+        unresolved_conflict_fields=unresolved_conflict_fields,
+        blocking_issues=blocking_issues,
+        optional_warnings=optional_warnings,
+    )
 
 
 class DatabaseJobLivenessChecker:
@@ -424,11 +624,19 @@ class DocumentService:
             await self._session.refresh(current_version)
 
         summary = _to_document_summary(document)
+        readiness = (
+            evaluate_meeting_minutes_readiness(
+                current_version.structured_content if current_version else None
+            )
+            if document.document_type == "meeting_minutes"
+            else None
+        )
         return DocumentDetailResponse(
             **summary.model_dump(),
             current_version=_to_version_response(current_version) if current_version else None,
             sources_count=0,
             jobs=[],
+            review_readiness=readiness,
         )
 
     async def get_document(self, actor: User, *, document_id: UUID) -> DocumentDetailResponse:
@@ -462,12 +670,560 @@ class DocumentService:
             )
         ).all()
         summary = _to_document_summary(document)
+        readiness = (
+            evaluate_meeting_minutes_readiness(
+                current_version.structured_content if current_version else None
+            )
+            if document.document_type == "meeting_minutes"
+            else None
+        )
         return DocumentDetailResponse(
             **summary.model_dump(),
             current_version=_to_version_response(current_version) if current_version else None,
             sources_count=sources_count,
             jobs=[_to_job_response(job) for job in jobs],
+            review_readiness=readiness,
         )
+
+    async def _normalize_and_validate_review_content(
+        self,
+        *,
+        document: Document,
+        current_version: DocumentVersion | None,
+        payload: DocumentUpdateRequest,
+    ) -> tuple[dict[str, object], bool, bool]:
+        """Validate human edits, enforce server-side provenance, and detect no-op saves."""
+        assert payload.structured_content is not None
+        submitted_keys = set(payload.structured_content.keys())
+        current_keys = (
+            set(current_version.structured_content.keys())
+            if current_version is not None
+            else set()
+        )
+        should_validate_review = (
+            document.status in ("review_required", "approved", "completed")
+            or bool(payload.resolved_conflict_fields)
+            or bool(submitted_keys & _REVIEW_SCHEMA_KEYS)
+            or bool(current_keys & _REVIEW_SCHEMA_KEYS)
+        )
+        if not should_validate_review:
+            raw_dict = dict(payload.structured_content)
+            is_noop = (
+                current_version is not None
+                and _hash_canonical_json(raw_dict) == current_version.content_hash
+            )
+            return raw_dict, False, is_noop
+
+        try:
+            parsed = MeetingMinutesReviewContent.model_validate(payload.structured_content)
+        except ValidationError as exc:
+            raise AppError(
+                code="VALIDATION_ERROR",
+                message="Struktur konten tinjauan dokumen tidak valid.",
+                status_code=422,
+            ) from exc
+
+        existing_versions = (
+            await self._session.scalars(
+                select(DocumentVersion)
+                .where(DocumentVersion.document_id == document.id)
+                .order_by(DocumentVersion.version_number.asc())
+            )
+        ).all()
+
+        ai_grounded_scalars: dict[str, list[tuple[str, list[ReviewProvenanceEntry]]]] = {
+            f: [] for f in _REVIEW_SCALAR_FIELDS
+        }
+        ai_grounded_lists: dict[str, list[tuple[tuple[str, ...], list[ReviewProvenanceEntry]]]] = {
+            f: [] for f in _REVIEW_SIMPLE_LIST_FIELDS
+        }
+        ai_conflict_provenance: dict[str, list[ReviewProvenanceEntry]] = {}
+        max_item_counts: dict[str, Counter[tuple[object, ...]]] = {
+            sec: Counter() for sec in _REVIEW_COMPLEX_LIST_FIELDS
+        }
+        ai_item_provenance: dict[tuple[str, UUID, str], list[ReviewProvenanceEntry]] = {}
+        server_conflicts_by_field: dict[str, ReviewConflictItem] = {}
+        server_system_warnings: list[str] = []
+
+        for ver in existing_versions:
+            try:
+                ver_parsed = MeetingMinutesReviewContent.model_validate(ver.structured_content)
+            except ValidationError:
+                continue
+
+            for conflict in ver_parsed.conflicts:
+                server_conflicts_by_field[conflict.field_path] = conflict
+
+            if ver.created_by_user_id is not None:
+                continue
+
+            for warning in ver_parsed.warnings:
+                cleaned_w = warning.strip()
+                if (
+                    cleaned_w
+                    and not cleaned_w.startswith("Konflik terdeteksi pada bidang ")
+                    and cleaned_w not in server_system_warnings
+                ):
+                    server_system_warnings.append(cleaned_w)
+
+            for field in _REVIEW_SCALAR_FIELDS:
+                val = _clean_optional_str(getattr(ver_parsed, field))
+                provs = [
+                    p
+                    for p in ver_parsed.provenance
+                    if _provenance_matches_field(p.field_path, field)
+                ]
+                if provs:
+                    ai_conflict_provenance.setdefault(field, []).extend(provs)
+                if ver_parsed.field_statuses.get(field) == "grounded" and val is not None:
+                    ai_grounded_scalars[field].append((val, provs))
+
+            for field in _REVIEW_SIMPLE_LIST_FIELDS:
+                items = _clean_string_list(getattr(ver_parsed, field))
+                provs = [
+                    p
+                    for p in ver_parsed.provenance
+                    if _provenance_matches_field(p.field_path, field)
+                ]
+                if provs:
+                    ai_conflict_provenance.setdefault(field, []).extend(provs)
+                if ver_parsed.field_statuses.get(field) == "grounded" and items:
+                    ai_grounded_lists[field].append((tuple(items), provs))
+
+            ver_counts: dict[str, Counter[tuple[object, ...]]] = {
+                sec: Counter() for sec in _REVIEW_COMPLEX_LIST_FIELDS
+            }
+            for op in ver_parsed.opinions:
+                exc_clean = _clean_optional_str(op.excerpt)
+                if op.source_id is not None and exc_clean is not None:
+                    sig: tuple[object, ...] = (
+                        op.statement.strip(),
+                        _clean_optional_str(op.speaker),
+                        op.source_id,
+                        exc_clean,
+                    )
+                    ver_counts["opinions"][sig] += 1
+            for prop in ver_parsed.proposals:
+                exc_clean = _clean_optional_str(prop.excerpt)
+                if prop.source_id is not None and exc_clean is not None:
+                    sig = (
+                        prop.proposal.strip(),
+                        _clean_optional_str(prop.proposer),
+                        prop.status,
+                        prop.source_id,
+                        exc_clean,
+                    )
+                    ver_counts["proposals"][sig] += 1
+            for dec in ver_parsed.decisions:
+                exc_clean = _clean_optional_str(dec.excerpt)
+                if dec.source_id is not None and exc_clean is not None:
+                    sig = (dec.decision.strip(), dec.source_id, exc_clean)
+                    ver_counts["decisions"][sig] += 1
+            for act in ver_parsed.action_items:
+                exc_clean = _clean_optional_str(act.excerpt)
+                if act.source_id is not None and exc_clean is not None:
+                    sig = (
+                        act.task.strip(),
+                        _clean_optional_str(act.assignee),
+                        _clean_optional_str(act.due_date),
+                        act.source_id,
+                        exc_clean,
+                    )
+                    ver_counts["action_items"][sig] += 1
+
+            for sec in _REVIEW_COMPLEX_LIST_FIELDS:
+                for sig, cnt in ver_counts[sec].items():
+                    if cnt > max_item_counts[sec][sig]:
+                        max_item_counts[sec][sig] = cnt
+
+            for prov in ver_parsed.provenance:
+                for sec in _REVIEW_COMPLEX_LIST_FIELDS:
+                    if _provenance_matches_field(prov.field_path, sec):
+                        key = (sec, prov.source_id, prov.excerpt.strip())
+                        ai_item_provenance.setdefault(key, []).append(prov)
+
+        current_parsed: MeetingMinutesReviewContent | None = None
+        if current_version is not None:
+            try:
+                current_parsed = MeetingMinutesReviewContent.model_validate(
+                    current_version.structured_content
+                )
+            except ValidationError:
+                current_parsed = None
+
+        if current_parsed is not None and not server_system_warnings:
+            for warning in current_parsed.warnings:
+                cleaned_w = warning.strip()
+                if (
+                    cleaned_w
+                    and not cleaned_w.startswith("Konflik terdeteksi pada bidang ")
+                    and cleaned_w not in server_system_warnings
+                ):
+                    server_system_warnings.append(cleaned_w)
+
+        current_conflicts_by_field: dict[str, ReviewConflictItem] = (
+            {c.field_path: c for c in current_parsed.conflicts}
+            if current_parsed is not None
+            else {}
+        )
+        active_conflicts_by_field: dict[str, ReviewConflictItem] = dict(
+            current_conflicts_by_field
+        )
+        for submitted_conflict in parsed.conflicts:
+            if (
+                submitted_conflict.field_path not in active_conflicts_by_field
+                and submitted_conflict.field_path in server_conflicts_by_field
+            ):
+                active_conflicts_by_field[submitted_conflict.field_path] = (
+                    server_conflicts_by_field[submitted_conflict.field_path]
+                )
+
+        def normalized_field_value(
+            model: MeetingMinutesReviewContent, field_name: str
+        ) -> object:
+            if field_name in _REVIEW_SCALAR_FIELDS:
+                return _clean_optional_str(cast(str | None, getattr(model, field_name)))
+            if field_name in _REVIEW_SIMPLE_LIST_FIELDS:
+                return _clean_string_list(cast(list[str], getattr(model, field_name)))
+            return getattr(model, field_name)
+
+        def is_non_empty_value(val: object) -> bool:
+            if val is None:
+                return False
+            if isinstance(val, str):
+                return bool(val.strip())
+            if isinstance(val, list):
+                return len(val) > 0
+            return True
+
+        resolved_set: set[str] = set()
+        for raw_field in payload.resolved_conflict_fields:
+            field_name = raw_field.strip()
+            if field_name not in _ALL_REVIEW_CONTENT_FIELDS:
+                raise AppError(
+                    code="VALIDATION_ERROR",
+                    message=f"Bidang konflik '{raw_field}' tidak dikenal.",
+                    status_code=422,
+                )
+            if not is_non_empty_value(normalized_field_value(parsed, field_name)):
+                raise AppError(
+                    code="VALIDATION_ERROR",
+                    message=f"Bidang konflik '{field_name}' tidak boleh kosong saat diselesaikan.",
+                    status_code=422,
+                )
+            resolved_set.add(field_name)
+
+        resolved_by_human: set[str] = set()
+        remaining_conflicts: list[ReviewConflictItem] = []
+        remaining_conflict_fields: set[str] = set()
+        for field_path, conflict_item in active_conflicts_by_field.items():
+            sub_val = normalized_field_value(parsed, field_path)
+            sub_non_empty = is_non_empty_value(sub_val)
+            cur_val = (
+                normalized_field_value(current_parsed, field_path)
+                if current_parsed is not None
+                else None
+            )
+            if not sub_non_empty:
+                is_resolved = False
+            elif field_path in resolved_set or (
+                field_path in current_conflicts_by_field
+                and current_parsed is not None
+                and sub_val != cur_val
+            ):
+                is_resolved = True
+            else:
+                is_resolved = False
+
+            if is_resolved:
+                resolved_by_human.add(field_path)
+            else:
+                remaining_conflicts.append(conflict_item)
+                remaining_conflict_fields.add(field_path)
+
+        new_field_statuses: dict[str, ReviewFieldStatus] = {}
+        new_provenance: list[ReviewProvenanceEntry] = []
+        seen_prov_keys: set[tuple[str, UUID, str]] = set()
+
+        def append_prov(entries: Sequence[ReviewProvenanceEntry]) -> None:
+            for entry in entries:
+                key = (entry.field_path, entry.source_id, entry.excerpt.strip())
+                if key not in seen_prov_keys and len(new_provenance) < 300:
+                    seen_prov_keys.add(key)
+                    new_provenance.append(entry)
+
+        normalized_scalars: dict[str, str | None] = {}
+        for field in _REVIEW_SCALAR_FIELDS:
+            sub_scalar = _clean_optional_str(cast(str | None, getattr(parsed, field)))
+            normalized_scalars[field] = sub_scalar
+            if field in remaining_conflict_fields:
+                new_field_statuses[field] = "conflicting"
+                append_prov(ai_conflict_provenance.get(field, []))
+            elif field in resolved_by_human:
+                new_field_statuses[field] = "user_provided"
+            elif sub_scalar is None:
+                new_field_statuses[field] = "missing"
+            else:
+                matching_ai = [
+                    provs for val, provs in ai_grounded_scalars[field] if val == sub_scalar
+                ]
+                cur_was_grounded = (
+                    current_parsed is not None
+                    and current_parsed.field_statuses.get(field) == "grounded"
+                    and _clean_optional_str(cast(str | None, getattr(current_parsed, field)))
+                    == sub_scalar
+                )
+                loaded_hist_grounded = parsed.field_statuses.get(field) == "grounded"
+                if matching_ai and (cur_was_grounded or loaded_hist_grounded):
+                    new_field_statuses[field] = "grounded"
+                    append_prov(matching_ai[-1])
+                else:
+                    new_field_statuses[field] = "user_provided"
+
+        normalized_lists: dict[str, list[str]] = {}
+        for field in _REVIEW_SIMPLE_LIST_FIELDS:
+            sub_list = _clean_string_list(cast(list[str], getattr(parsed, field)))
+            normalized_lists[field] = sub_list
+            if field in remaining_conflict_fields:
+                new_field_statuses[field] = "conflicting"
+                append_prov(ai_conflict_provenance.get(field, []))
+            elif field in resolved_by_human:
+                new_field_statuses[field] = "user_provided"
+            elif not sub_list:
+                new_field_statuses[field] = "missing"
+            else:
+                sub_tuple = tuple(sub_list)
+                matching_ai = [
+                    provs for vals, provs in ai_grounded_lists[field] if vals == sub_tuple
+                ]
+                cur_was_grounded = (
+                    current_parsed is not None
+                    and current_parsed.field_statuses.get(field) == "grounded"
+                    and _clean_string_list(cast(list[str], getattr(current_parsed, field)))
+                    == sub_list
+                )
+                loaded_hist_grounded = parsed.field_statuses.get(field) == "grounded"
+                if matching_ai and (cur_was_grounded or loaded_hist_grounded):
+                    new_field_statuses[field] = "grounded"
+                    append_prov(matching_ai[-1])
+                else:
+                    new_field_statuses[field] = "user_provided"
+
+        remaining_allowance = {
+            sec: Counter(cnts) for sec, cnts in max_item_counts.items()
+        }
+
+        norm_opinions: list[ReviewOpinionItem] = []
+        for op in parsed.opinions:
+            stmt = op.statement.strip()
+            spk = _clean_optional_str(op.speaker)
+            excerpt_clean = _clean_optional_str(op.excerpt)
+            if op.source_id is not None and excerpt_clean is not None:
+                sig = (stmt, spk, op.source_id, excerpt_clean)
+                if remaining_allowance["opinions"][sig] > 0:
+                    remaining_allowance["opinions"][sig] -= 1
+                    norm_opinions.append(
+                        ReviewOpinionItem(
+                            statement=stmt,
+                            speaker=spk,
+                            origin="grounded",
+                            source_id=op.source_id,
+                            excerpt=excerpt_clean,
+                        )
+                    )
+                    append_prov(
+                        ai_item_provenance.get(("opinions", op.source_id, excerpt_clean), [])
+                    )
+                    continue
+            norm_opinions.append(
+                ReviewOpinionItem(
+                    statement=stmt,
+                    speaker=spk,
+                    origin="user_provided",
+                    source_id=None,
+                    excerpt=None,
+                )
+            )
+        if "opinions" in remaining_conflict_fields:
+            new_field_statuses["opinions"] = "conflicting"
+        elif not norm_opinions:
+            new_field_statuses["opinions"] = "missing"
+        elif all(item.origin == "grounded" for item in norm_opinions):
+            new_field_statuses["opinions"] = "grounded"
+        else:
+            new_field_statuses["opinions"] = "user_provided"
+
+        norm_proposals: list[ReviewProposalItem] = []
+        for prop in parsed.proposals:
+            prop_text = prop.proposal.strip()
+            proposer = _clean_optional_str(prop.proposer)
+            excerpt_clean = _clean_optional_str(prop.excerpt)
+            if prop.source_id is not None and excerpt_clean is not None:
+                sig = (prop_text, proposer, prop.status, prop.source_id, excerpt_clean)
+                if remaining_allowance["proposals"][sig] > 0:
+                    remaining_allowance["proposals"][sig] -= 1
+                    norm_proposals.append(
+                        ReviewProposalItem(
+                            proposal=prop_text,
+                            proposer=proposer,
+                            status=prop.status,
+                            origin="grounded",
+                            source_id=prop.source_id,
+                            excerpt=excerpt_clean,
+                        )
+                    )
+                    append_prov(
+                        ai_item_provenance.get(("proposals", prop.source_id, excerpt_clean), [])
+                    )
+                    continue
+            norm_proposals.append(
+                ReviewProposalItem(
+                    proposal=prop_text,
+                    proposer=proposer,
+                    status=prop.status,
+                    origin="user_provided",
+                    source_id=None,
+                    excerpt=None,
+                )
+            )
+        if "proposals" in remaining_conflict_fields:
+            new_field_statuses["proposals"] = "conflicting"
+        elif not norm_proposals:
+            new_field_statuses["proposals"] = "missing"
+        elif all(item.origin == "grounded" for item in norm_proposals):
+            new_field_statuses["proposals"] = "grounded"
+        else:
+            new_field_statuses["proposals"] = "user_provided"
+
+        norm_decisions: list[ReviewDecisionItem] = []
+        for dec in parsed.decisions:
+            dec_text = dec.decision.strip()
+            excerpt_clean = _clean_optional_str(dec.excerpt)
+            if dec.source_id is not None and excerpt_clean is not None:
+                sig = (dec_text, dec.source_id, excerpt_clean)
+                if remaining_allowance["decisions"][sig] > 0:
+                    remaining_allowance["decisions"][sig] -= 1
+                    norm_decisions.append(
+                        ReviewDecisionItem(
+                            decision=dec_text,
+                            origin="grounded",
+                            source_id=dec.source_id,
+                            excerpt=excerpt_clean,
+                        )
+                    )
+                    append_prov(
+                        ai_item_provenance.get(("decisions", dec.source_id, excerpt_clean), [])
+                    )
+                    continue
+            norm_decisions.append(
+                ReviewDecisionItem(
+                    decision=dec_text,
+                    origin="user_provided",
+                    source_id=None,
+                    excerpt=None,
+                )
+            )
+        if "decisions" in remaining_conflict_fields:
+            new_field_statuses["decisions"] = "conflicting"
+        elif not norm_decisions:
+            new_field_statuses["decisions"] = "missing"
+        elif all(item.origin == "grounded" for item in norm_decisions):
+            new_field_statuses["decisions"] = "grounded"
+        else:
+            new_field_statuses["decisions"] = "user_provided"
+
+        norm_actions: list[ReviewActionItem] = []
+        for act in parsed.action_items:
+            task_text = act.task.strip()
+            assignee = _clean_optional_str(act.assignee)
+            due_date = _clean_optional_str(act.due_date)
+            excerpt_clean = _clean_optional_str(act.excerpt)
+            if act.source_id is not None and excerpt_clean is not None:
+                sig = (task_text, assignee, due_date, act.source_id, excerpt_clean)
+                if remaining_allowance["action_items"][sig] > 0:
+                    remaining_allowance["action_items"][sig] -= 1
+                    norm_actions.append(
+                        ReviewActionItem(
+                            task=task_text,
+                            assignee=assignee,
+                            due_date=due_date,
+                            origin="grounded",
+                            source_id=act.source_id,
+                            excerpt=excerpt_clean,
+                        )
+                    )
+                    append_prov(
+                        ai_item_provenance.get(
+                            ("action_items", act.source_id, excerpt_clean), []
+                        )
+                    )
+                    continue
+            norm_actions.append(
+                ReviewActionItem(
+                    task=task_text,
+                    assignee=assignee,
+                    due_date=due_date,
+                    origin="user_provided",
+                    source_id=None,
+                    excerpt=None,
+                )
+            )
+        if "action_items" in remaining_conflict_fields:
+            new_field_statuses["action_items"] = "conflicting"
+        elif not norm_actions:
+            new_field_statuses["action_items"] = "missing"
+        elif all(item.origin == "grounded" for item in norm_actions):
+            new_field_statuses["action_items"] = "grounded"
+        else:
+            new_field_statuses["action_items"] = "user_provided"
+
+        final_warnings = list(server_system_warnings)
+        for conflict in remaining_conflicts:
+            c_warn = f"Konflik terdeteksi pada bidang '{conflict.field_path}'."
+            if c_warn not in final_warnings:
+                final_warnings.append(c_warn)
+
+        normalized_model = MeetingMinutesReviewContent(
+            meeting_title=normalized_scalars["meeting_title"],
+            meeting_date=normalized_scalars["meeting_date"],
+            meeting_time=normalized_scalars["meeting_time"],
+            location=normalized_scalars["location"],
+            organizer=normalized_scalars["organizer"],
+            chairperson=normalized_scalars["chairperson"],
+            attendees=normalized_lists["attendees"],
+            absentees=normalized_lists["absentees"],
+            agenda_items=normalized_lists["agenda_items"],
+            discussion_summary=normalized_scalars["discussion_summary"],
+            opinions=norm_opinions,
+            proposals=norm_proposals,
+            decisions=norm_decisions,
+            action_items=norm_actions,
+            field_statuses=new_field_statuses,
+            conflicts=remaining_conflicts,
+            provenance=new_provenance,
+            warnings=final_warnings[:50],
+        )
+        normalized_dict = cast(dict[str, object], normalized_model.model_dump(mode="json"))
+
+        is_noop = False
+        if current_version is not None and not resolved_by_human:
+            raw_hash = _hash_canonical_json(dict(payload.structured_content))
+            new_hash = _hash_canonical_json(normalized_dict)
+            if (
+                raw_hash == current_version.content_hash
+                or new_hash == current_version.content_hash
+                or (
+                    current_parsed is not None
+                    and current_version.created_by_user_id is None
+                    and _content_fields_signature(normalized_model)
+                    == _content_fields_signature(current_parsed)
+                    and {c.field_path for c in remaining_conflicts}
+                    == {c.field_path for c in current_parsed.conflicts}
+                )
+            ):
+                is_noop = True
+
+        return normalized_dict, True, is_noop
 
     async def update_document(
         self,
@@ -476,7 +1232,7 @@ class DocumentService:
         document_id: UUID,
         payload: DocumentUpdateRequest,
     ) -> DocumentDetailResponse:
-        """Update document title/template or append a new version on structured edit."""
+        """Update document metadata or create a new version on substantive structured edit."""
         document, workspace, _ = await self._require_authorized_document(
             actor,
             document_id=document_id,
@@ -487,6 +1243,39 @@ class DocumentService:
             raise AppError(
                 code="CONFLICT",
                 message="Dokumen sedang diproses atau diarsipkan dan tidak dapat diubah.",
+                status_code=409,
+            )
+
+        current_version: DocumentVersion | None = None
+        if document.current_version_id is not None:
+            current_version = await self._session.scalar(
+                select(DocumentVersion)
+                .where(
+                    DocumentVersion.id == document.current_version_id,
+                    DocumentVersion.document_id == document.id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+
+        if (
+            payload.expected_version_id is not None
+            and document.current_version_id != payload.expected_version_id
+        ):
+            raise AppError(
+                code="CONFLICT",
+                message="Versi dokumen telah berubah. Muat ulang dokumen sebelum menyimpan.",
+                status_code=409,
+            )
+        if payload.expected_content_hash is not None and (
+            current_version is None
+            or current_version.content_hash.lower() != payload.expected_content_hash.strip().lower()
+        ):
+            raise AppError(
+                code="CONFLICT",
+                message=(
+                    "Hash konten versi dokumen tidak cocok. Muat ulang dokumen sebelum menyimpan."
+                ),
                 status_code=409,
             )
 
@@ -501,41 +1290,94 @@ class DocumentService:
             document.title = payload.title
 
         now = datetime.now(UTC)
+        created_version_number: int | None = None
+        approval_invalidated = False
+        previous_status = document.status
+        superseded_version_id: UUID | None = None
+        new_version_id: UUID | None = None
+
         if payload.structured_content is not None:
-            max_ver = await self._session.scalar(
-                select(func.max(DocumentVersion.version_number)).where(
-                    DocumentVersion.document_id == document.id
-                )
+            (
+                normalized_content,
+                is_review_schema_content,
+                is_noop,
+            ) = await self._normalize_and_validate_review_content(
+                document=document,
+                current_version=current_version,
+                payload=payload,
             )
-            next_number = int(max_ver or 0) + 1
-            if document.approved_version_id is not None:
-                prev_approved = await self._session.scalar(
-                    select(DocumentVersion).where(
-                        DocumentVersion.id == document.approved_version_id,
-                        DocumentVersion.document_id == document.id,
+            if not is_noop:
+                max_ver = await self._session.scalar(
+                    select(func.max(DocumentVersion.version_number)).where(
+                        DocumentVersion.document_id == document.id
                     )
                 )
-                if prev_approved is not None:
-                    prev_approved.approval_status = "superseded"
-                document.approved_version_id = None
-                document.status = "review_required"
-            elif document.status in ("approved", "completed", "failed"):
-                document.status = "review_required"
+                next_number = int(max_ver or 0) + 1
+                created_version_number = next_number
 
-            new_version = DocumentVersion(
-                document_id=document.id,
-                version_number=next_number,
-                structured_content=dict(payload.structured_content),
-                content_hash=_hash_canonical_json(dict(payload.structured_content)),
-                created_by_user_id=actor.id,
-                created_at=now,
-                approval_status="pending",
-            )
-            self._session.add(new_version)
-            await self._session.flush()
-            document.current_version_id = new_version.id
+                if current_version is not None and current_version.approval_status in (
+                    "pending",
+                    "approved",
+                ):
+                    current_version.approval_status = "superseded"
+                    if document.approved_version_id == current_version.id:
+                        superseded_version_id = current_version.id
+
+                if document.approved_version_id is not None:
+                    approval_invalidated = True
+                    if (
+                        current_version is None
+                        or document.approved_version_id != current_version.id
+                    ):
+                        prev_approved = await self._session.scalar(
+                            select(DocumentVersion)
+                            .where(
+                                DocumentVersion.id == document.approved_version_id,
+                                DocumentVersion.document_id == document.id,
+                            )
+                            .with_for_update()
+                            .execution_options(populate_existing=True)
+                        )
+                        if prev_approved is not None:
+                            prev_approved.approval_status = "superseded"
+                            superseded_version_id = prev_approved.id
+                    document.approved_version_id = None
+
+                if (
+                    document.status in ("approved", "completed", "failed", "review_required")
+                    or is_review_schema_content
+                ):
+                    document.status = "review_required"
+
+                new_version = DocumentVersion(
+                    document_id=document.id,
+                    version_number=next_number,
+                    structured_content=normalized_content,
+                    content_hash=_hash_canonical_json(normalized_content),
+                    created_by_user_id=actor.id,
+                    created_at=now,
+                    approval_status="pending",
+                )
+                self._session.add(new_version)
+                await self._session.flush()
+                document.current_version_id = new_version.id
+                new_version_id = new_version.id
 
         document.updated_at = now
+        audit_meta: dict[str, object] = {
+            "versioned_edit": created_version_number is not None,
+            "previous_status": previous_status,
+            "approval_invalidated": approval_invalidated,
+        }
+        if created_version_number is not None:
+            audit_meta["version_number"] = created_version_number
+        if superseded_version_id is not None:
+            audit_meta["superseded_version_id"] = str(superseded_version_id)
+        if new_version_id is not None:
+            audit_meta["new_version_id"] = str(new_version_id)
+        if payload.resolved_conflict_fields:
+            audit_meta["resolved_conflicts"] = list(payload.resolved_conflict_fields)
+
         record_workspace_audit(
             self._session,
             workspace_id=document.workspace_id,
@@ -543,7 +1385,101 @@ class DocumentService:
             action="documents.updated",
             resource_type="document",
             resource_id=str(document.id),
-            metadata={"versioned_edit": payload.structured_content is not None},
+            metadata=audit_meta,
+        )
+        await self._session.commit()
+        return await self.get_document(actor, document_id=document.id)
+
+    async def approve_document(
+        self,
+        actor: User,
+        *,
+        document_id: UUID,
+        payload: ApproveDocumentRequest,
+    ) -> DocumentDetailResponse:
+        """Explicitly approve the exact current document version after precondition checks."""
+        document, _, _ = await self._require_authorized_document(
+            actor,
+            document_id=document_id,
+            action="approve",
+            lock_document=True,
+        )
+        if document.current_version_id is None:
+            raise AppError(
+                code="CONFLICT",
+                message="Dokumen belum memiliki versi draf untuk disetujui.",
+                status_code=409,
+            )
+
+        current_version = await self._session.scalar(
+            select(DocumentVersion)
+            .where(
+                DocumentVersion.id == document.current_version_id,
+                DocumentVersion.document_id == document.id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if current_version is None:
+            raise AppError(
+                code="CONFLICT",
+                message="Versi dokumen saat ini tidak ditemukan.",
+                status_code=409,
+            )
+
+        if (
+            payload.version_id != current_version.id
+            or payload.content_hash.strip().lower() != current_version.content_hash.lower()
+        ):
+            raise AppError(
+                code="CONFLICT",
+                message="Versi atau hash konten dokumen tidak sesuai dengan versi terbaru.",
+                status_code=409,
+            )
+
+        if (
+            document.status == "approved"
+            and document.approved_version_id == current_version.id
+            and current_version.approval_status == "approved"
+        ):
+            return await self.get_document(actor, document_id=document.id)
+
+        if document.status != "review_required":
+            raise AppError(
+                code="INVALID_JOB_STATE",
+                message="Hanya dokumen dengan status review_required yang dapat disetujui.",
+                status_code=409,
+            )
+
+        readiness = evaluate_meeting_minutes_readiness(current_version.structured_content)
+        if not readiness.is_ready_for_approval:
+            raise AppError(
+                code="VALIDATION_ERROR",
+                message="Dokumen belum memenuhi prasyarat persetujuan.",
+                status_code=422,
+                details=readiness.model_dump(),
+            )
+
+        now = datetime.now(UTC)
+        current_version.approval_status = "approved"
+        current_version.approved_by_user_id = actor.id
+        current_version.approved_at = now
+        document.approved_version_id = current_version.id
+        document.status = "approved"
+        document.updated_at = now
+
+        record_workspace_audit(
+            self._session,
+            workspace_id=document.workspace_id,
+            actor_user_id=actor.id,
+            action="documents.approved",
+            resource_type="document",
+            resource_id=str(document.id),
+            metadata={
+                "version_id": str(current_version.id),
+                "version_number": current_version.version_number,
+                "content_hash": current_version.content_hash,
+            },
         )
         await self._session.commit()
         return await self.get_document(actor, document_id=document.id)

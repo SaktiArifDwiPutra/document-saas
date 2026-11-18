@@ -207,12 +207,20 @@ export default function WorkspacesPage() {
               Kelola &amp; Pilih Workspace Aktif
             </h1>
           </div>
-          <Link
-            href="/"
-            className="rounded-md border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
-          >
-            Kembali ke Beranda
-          </Link>
+          <div className="flex flex-wrap gap-2">
+            <Link
+              href="/documents"
+              className="rounded-md border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
+            >
+              Tinjau Dokumen
+            </Link>
+            <Link
+              href="/"
+              className="rounded-md border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
+            >
+              Kembali ke Beranda
+            </Link>
+          </div>
         </div>
 
         <p className="mt-2 text-sm text-slate-600">
