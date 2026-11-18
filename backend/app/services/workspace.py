@@ -25,7 +25,7 @@ from app.core.security import (
     normalize_email,
 )
 from app.models.auth import User
-from app.models.workspace import AuditLog, Invitation, Workspace, WorkspaceMember
+from app.models.workspace import Invitation, Workspace, WorkspaceMember
 from app.schemas.workspace import (
     InvitationListResponse,
     InvitationResponse,
@@ -34,7 +34,12 @@ from app.schemas.workspace import (
     WorkspaceMemberResponse,
     WorkspaceResponse,
 )
+from app.services.credit import CreditService
 from app.services.email import EmailService
+from app.services.workspace_access import (
+    record_workspace_audit,
+    require_active_workspace_membership,
+)
 
 
 def _to_workspace_response(workspace: Workspace, member: WorkspaceMember) -> WorkspaceResponse:
@@ -99,15 +104,14 @@ class WorkspaceService:
         resource_id: str,
         metadata: Mapping[str, object] | None = None,
     ) -> None:
-        self._session.add(
-            AuditLog(
-                workspace_id=workspace_id,
-                actor_user_id=actor_user_id,
-                action=action,
-                resource_type=resource_type,
-                resource_id=resource_id,
-                metadata_json=dict(metadata) if metadata else {},
-            )
+        record_workspace_audit(
+            self._session,
+            workspace_id=workspace_id,
+            actor_user_id=actor_user_id,
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            metadata=metadata,
         )
 
     async def _require_active_membership(
@@ -117,58 +121,12 @@ class WorkspaceService:
         user_id: UUID,
         lock_workspace: bool = False,
     ) -> tuple[Workspace, WorkspaceMember]:
-        workspace = await self._session.scalar(
-            select(Workspace).where(
-                Workspace.id == workspace_id,
-                Workspace.status == "active",
-                Workspace.deleted_at.is_(None),
-            )
+        return await require_active_workspace_membership(
+            self._session,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            lock_workspace=lock_workspace,
         )
-        member = await self._session.scalar(
-            select(WorkspaceMember).where(
-                WorkspaceMember.workspace_id == workspace_id,
-                WorkspaceMember.user_id == user_id,
-                WorkspaceMember.status == "active",
-            )
-        )
-        if workspace is None or member is None:
-            raise AppError(
-                code="FORBIDDEN",
-                message="Anda tidak memiliki akses ke workspace ini.",
-                status_code=403,
-            )
-
-        if lock_workspace:
-            locked_workspace = await self._session.scalar(
-                select(Workspace)
-                .where(
-                    Workspace.id == workspace_id,
-                    Workspace.status == "active",
-                    Workspace.deleted_at.is_(None),
-                )
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-            locked_member = await self._session.scalar(
-                select(WorkspaceMember)
-                .where(
-                    WorkspaceMember.workspace_id == workspace_id,
-                    WorkspaceMember.user_id == user_id,
-                    WorkspaceMember.status == "active",
-                )
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-            if locked_workspace is None or locked_member is None:
-                await self._session.rollback()
-                raise AppError(
-                    code="FORBIDDEN",
-                    message="Anda tidak memiliki akses ke workspace ini.",
-                    status_code=403,
-                )
-            return locked_workspace, locked_member
-
-        return workspace, member
 
     async def list_workspaces(
         self,
@@ -234,6 +192,13 @@ class WorkspaceService:
             updated_at=now,
         )
         self._session.add(owner_member)
+        await CreditService(
+            session=self._session, settings=self._settings
+        ).initialize_workspace_wallet(
+            workspace.id,
+            created_by_user_id=user.id,
+            commit=False,
+        )
         self._record_audit(
             workspace_id=workspace.id,
             actor_user_id=user.id,

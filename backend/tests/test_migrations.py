@@ -62,7 +62,7 @@ def test_alembic_baseline_upgrade_and_downgrade(tmp_path: Path) -> None:
     alembic_cfg.set_main_option("sqlalchemy.url", async_url)
 
     script_dir = ScriptDirectory.from_config(alembic_cfg)
-    assert script_dir.get_heads() == ["0003_m3_workspaces_rbac"]
+    assert script_dir.get_heads() == ["0004_m4_credit_engine"]
 
     command.upgrade(alembic_cfg, "head")
 
@@ -78,6 +78,10 @@ def test_alembic_baseline_upgrade_and_downgrade(tmp_path: Path) -> None:
             "workspace_members",
             "invitations",
             "audit_logs",
+            "credit_wallets",
+            "credit_transactions",
+            "credit_reservations",
+            "credit_packages",
         }.issubset(tables)
     sync_engine.dispose()
 
@@ -129,7 +133,7 @@ def test_alembic_baseline_upgrade_and_downgrade_postgresql(tmp_path: Path) -> No
 
         command.upgrade(alembic_cfg, "head")
         assert asyncio.run(_fetch_alembic_versions(test_db_url)) == [
-            "0003_m3_workspaces_rbac"
+            "0004_m4_credit_engine"
         ]
         pg_tables = asyncio.run(_fetch_pg_tables(test_db_url))
         assert {
@@ -141,6 +145,10 @@ def test_alembic_baseline_upgrade_and_downgrade_postgresql(tmp_path: Path) -> No
             "workspace_members",
             "invitations",
             "audit_logs",
+            "credit_wallets",
+            "credit_transactions",
+            "credit_reservations",
+            "credit_packages",
         }.issubset(pg_tables)
 
         command.downgrade(alembic_cfg, "base")
@@ -154,6 +162,10 @@ def test_alembic_baseline_upgrade_and_downgrade_postgresql(tmp_path: Path) -> No
             "workspace_members",
             "invitations",
             "audit_logs",
+            "credit_wallets",
+            "credit_transactions",
+            "credit_reservations",
+            "credit_packages",
         }.isdisjoint(pg_tables_after)
     finally:
         subprocess.run(

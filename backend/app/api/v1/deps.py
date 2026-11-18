@@ -14,6 +14,7 @@ from app.core.security import decode_access_token
 from app.db.session import get_db_session
 from app.models.auth import User
 from app.services.auth import AuthService
+from app.services.credit import CreditService
 from app.services.email import EmailService, StubEmailService
 from app.services.workspace import WorkspaceService
 
@@ -68,6 +69,14 @@ def get_workspace_service(
 ) -> WorkspaceService:
     """Construct WorkspaceService with injected DB session, settings, and email provider."""
     return WorkspaceService(session=session, settings=settings, email_service=email_service)
+
+
+def get_credit_service(
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> CreditService:
+    """Construct CreditService with injected DB session and settings."""
+    return CreditService(session=session, settings=settings)
 
 
 async def get_current_user(

@@ -87,6 +87,7 @@ class Settings(BaseSettings):
 
     # Configurable beta complimentary credits; exact initial amount remains TBD by Product Owner.
     beta_complimentary_credits: int | None = Field(default=None, ge=0)
+    credit_reservation_ttl_seconds: int = Field(default=900, ge=60, le=86400)
 
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
 

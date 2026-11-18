@@ -14,6 +14,7 @@ WorkspaceAction = Literal[
     "delete_workspace",
     "transfer_ownership",
     "view_members",
+    "view_credits",
     "manage_invitations",
     "manage_members",
     "manage_templates",
@@ -40,7 +41,7 @@ _ORG_ONLY_WORKSPACE_ACTIONS: frozenset[WorkspaceAction] = frozenset(
 )
 
 _COMMON_READ_ACTIONS: frozenset[WorkspaceAction] = frozenset(
-    {"view", "view_members", "create_document"}
+    {"view", "view_members", "view_credits", "create_document"}
 )
 
 

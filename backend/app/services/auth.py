@@ -22,6 +22,7 @@ from app.core.security import (
 from app.models.auth import AuthActionToken, AuthSession, User
 from app.models.workspace import Workspace, WorkspaceMember
 from app.schemas.auth import AuthTokenResponse, UserProfileResponse
+from app.services.credit import CreditService
 from app.services.email import EmailService
 
 
@@ -210,6 +211,13 @@ class AuthService:
                 role="owner",
                 status="active",
             )
+        )
+        await CreditService(
+            session=self._session, settings=self._settings
+        ).initialize_workspace_wallet(
+            personal_workspace.id,
+            created_by_user_id=user.id,
+            commit=False,
         )
 
         verification_token = await self._create_action_token(

@@ -5,6 +5,12 @@ import { FormEvent, useState } from "react";
 
 import { ApiClientError, refreshSession } from "@/lib/auth";
 import {
+  CreditTransactionItem,
+  CreditWalletData,
+  getWorkspaceCredits,
+  listWorkspaceCreditTransactions,
+} from "@/lib/credits";
+import {
   acceptWorkspaceInvitation,
   AssignableMemberRole,
   createOrganizationWorkspace,
@@ -23,6 +29,8 @@ export default function WorkspacesPage() {
   const [workspaces, setWorkspaces] = useState<WorkspaceItem[]>([]);
   const [activeWorkspace, setActiveWorkspace] = useState<WorkspaceItem | null>(null);
   const [members, setMembers] = useState<WorkspaceMemberItem[]>([]);
+  const [creditWallet, setCreditWallet] = useState<CreditWalletData | null>(null);
+  const [creditTransactions, setCreditTransactions] = useState<CreditTransactionItem[]>([]);
   const [newOrgName, setNewOrgName] = useState("");
   const [inviteEmail, setInviteEmail] = useState("");
   const [inviteRole, setInviteRole] = useState<AssignableMemberRole>("member");
@@ -31,16 +39,28 @@ export default function WorkspacesPage() {
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
+  async function loadWorkspaceContext(token: string, workspaceId: string) {
+    const [membersData, walletData, txData] = await Promise.all([
+      listWorkspaceMembers(token, workspaceId),
+      getWorkspaceCredits(token, workspaceId),
+      listWorkspaceCreditTransactions(token, workspaceId, 1, 10),
+    ]);
+    setMembers(membersData.items);
+    setCreditWallet(walletData);
+    setCreditTransactions(txData.items);
+  }
+
   async function syncWorkspaces(token: string, preferredWorkspaceId?: string) {
     const data = await listWorkspaces(token);
     setWorkspaces(data.items);
     const resolved = resolveActiveWorkspace(data.items, preferredWorkspaceId);
     setActiveWorkspace(resolved);
     if (resolved) {
-      const membersData = await listWorkspaceMembers(token, resolved.id);
-      setMembers(membersData.items);
+      await loadWorkspaceContext(token, resolved.id);
     } else {
       setMembers([]);
+      setCreditWallet(null);
+      setCreditTransactions([]);
     }
   }
 
@@ -76,8 +96,7 @@ export default function WorkspacesPage() {
       const details = await getWorkspaceDetails(accessToken.trim(), workspaceId);
       setStoredActiveWorkspaceId(details.id);
       setActiveWorkspace(details);
-      const membersData = await listWorkspaceMembers(accessToken.trim(), details.id);
-      setMembers(membersData.items);
+      await loadWorkspaceContext(accessToken.trim(), details.id);
       setStatusMessage(`Workspace aktif beralih ke ${details.name}.`);
     } catch (error) {
       if (error instanceof ApiClientError) {
@@ -288,6 +307,46 @@ export default function WorkspacesPage() {
               })}
             </ul>
           )}
+
+          {activeWorkspace && creditWallet ? (
+            <div className="mt-6 border-t border-slate-100 pt-4">
+              <h3 className="text-sm font-semibold text-slate-900">
+                Ringkasan Kredit ({activeWorkspace.name})
+              </h3>
+              <dl className="mt-2 grid grid-cols-3 gap-2 rounded-md border border-slate-200 bg-slate-50 p-3 text-center text-xs">
+                <div>
+                  <dt className="text-slate-500">Tersedia</dt>
+                  <dd className="mt-0.5 font-mono text-sm font-semibold text-slate-900">
+                    {creditWallet.available_balance}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-slate-500">Dicadangkan</dt>
+                  <dd className="mt-0.5 font-mono text-sm font-semibold text-slate-900">
+                    {creditWallet.reserved_balance}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-slate-500">Total</dt>
+                  <dd className="mt-0.5 font-mono text-sm font-semibold text-slate-900">
+                    {creditWallet.total_balance}
+                  </dd>
+                </div>
+              </dl>
+              {creditTransactions.length > 0 ? (
+                <ul className="mt-3 space-y-1 text-xs text-slate-600">
+                  {creditTransactions.map((tx) => (
+                    <li key={tx.id} className="flex justify-between gap-2">
+                      <span className="truncate">{tx.description}</span>
+                      <span className="font-mono font-medium text-slate-800">
+                        {tx.amount >= 0 ? `+${tx.amount}` : tx.amount} ({tx.transaction_type})
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+            </div>
+          ) : null}
 
           {activeWorkspace && members.length > 0 ? (
             <div className="mt-6 border-t border-slate-100 pt-4">
