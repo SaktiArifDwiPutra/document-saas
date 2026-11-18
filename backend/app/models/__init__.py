@@ -10,6 +10,7 @@ from app.models.document import (
     JobAttempt,
     Template,
     TemplateVersion,
+    UsageEvent,
     WorkflowCallbackEvent,
 )
 from app.models.workspace import AuditLog, Invitation, Workspace, WorkspaceMember
@@ -30,6 +31,7 @@ __all__ = [
     "JobAttempt",
     "Template",
     "TemplateVersion",
+    "UsageEvent",
     "User",
     "WorkflowCallbackEvent",
     "Workspace",

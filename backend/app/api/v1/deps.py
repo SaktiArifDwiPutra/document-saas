@@ -2,6 +2,7 @@
 
 from typing import Annotated
 
+import httpx
 from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
@@ -9,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
 from app.core.errors import AppError
+from app.core.internal_auth import InMemoryReplayGuard
 from app.core.rate_limit import SlidingWindowRateLimiter
 from app.core.security import decode_access_token
 from app.db.session import get_db_session
@@ -17,13 +19,32 @@ from app.services.auth import AuthService
 from app.services.credit import CreditService
 from app.services.document import DocumentService
 from app.services.email import EmailService, StubEmailService
+from app.services.gemini import (
+    DeterministicMeetingMinutesProvider,
+    GeminiProvider,
+    HttpGeminiProvider,
+)
+from app.services.internal_workflow import InternalWorkflowService
 from app.services.storage import InMemoryObjectStorage, ObjectStorageService
 from app.services.workspace import WorkspaceService
 
 _bearer_scheme = HTTPBearer(auto_error=False)
 _default_email_service = StubEmailService()
 _default_object_storage = InMemoryObjectStorage()
+_default_internal_replay_guard: InMemoryReplayGuard | None = None
 _default_rate_limiter: SlidingWindowRateLimiter | None = None
+
+
+def get_internal_replay_guard(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> InMemoryReplayGuard:
+    """Return shared internal replay guard bound to configured timestamp tolerance."""
+    global _default_internal_replay_guard
+    if _default_internal_replay_guard is None:
+        _default_internal_replay_guard = InMemoryReplayGuard(
+            tolerance_seconds=settings.internal_hmac_timestamp_tolerance_seconds
+        )
+    return _default_internal_replay_guard
 
 
 def get_email_service() -> EmailService:
@@ -94,6 +115,44 @@ def get_document_service(
 ) -> DocumentService:
     """Construct DocumentService with injected DB session, settings, and storage."""
     return DocumentService(session=session, settings=settings, storage=storage)
+
+
+def get_internal_workflow_service(
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    replay_guard: Annotated[InMemoryReplayGuard, Depends(get_internal_replay_guard)],
+) -> InternalWorkflowService:
+    """Construct InternalWorkflowService with DB session, settings, and replay guard."""
+    return InternalWorkflowService(
+        session=session,
+        settings=settings,
+        replay_guard=replay_guard,
+    )
+
+
+def get_gemini_provider(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> GeminiProvider:
+    """Return configured Gemini provider (or app.state override for test transports)."""
+    override = getattr(request.app.state, "gemini_provider", None)
+    if override is not None:
+        return override  # type: ignore[no-any-return]
+    if settings.gemini_provider_mode == "http":
+        return HttpGeminiProvider(settings=settings)
+    return DeterministicMeetingMinutesProvider(model_name=settings.gemini_model)
+
+
+def get_worker_http_client(request: Request) -> httpx.AsyncClient | None:
+    """Return optional Worker AsyncClient bound on app.state (used in ASGI/integration tests)."""
+    client = getattr(request.app.state, "worker_http_client", None)
+    return client if isinstance(client, httpx.AsyncClient) else None
+
+
+def get_n8n_http_client(request: Request) -> httpx.AsyncClient | None:
+    """Return optional n8n AsyncClient bound on app.state (used in ASGI/integration tests)."""
+    client = getattr(request.app.state, "n8n_http_client", None)
+    return client if isinstance(client, httpx.AsyncClient) else None
 
 
 async def get_current_user(

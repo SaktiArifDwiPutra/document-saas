@@ -3,9 +3,19 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+import httpx
+from fastapi import APIRouter, Depends, Query, Request
 
-from app.api.v1.deps import get_current_user, get_document_service
+from app.api.v1.deps import (
+    get_current_user,
+    get_document_service,
+    get_gemini_provider,
+    get_internal_workflow_service,
+    get_n8n_http_client,
+    get_object_storage,
+    get_worker_http_client,
+)
+from app.core.config import Settings, get_settings
 from app.core.errors import ApiResponse
 from app.models.auth import User
 from app.schemas.document import (
@@ -25,6 +35,9 @@ from app.schemas.document import (
     UploadIntentResponse,
 )
 from app.services.document import DocumentService
+from app.services.gemini import GeminiProvider
+from app.services.internal_workflow import InternalWorkflowService
+from app.services.storage import ObjectStorageService
 
 documents_router = APIRouter(tags=["documents"])
 jobs_router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -183,16 +196,52 @@ async def list_document_sources(
 )
 async def process_document(
     document_id: UUID,
+    request: Request,
     current_user: Annotated[User, Depends(get_current_user)],
     document_service: Annotated[DocumentService, Depends(get_document_service)],
+    internal_service: Annotated[InternalWorkflowService, Depends(get_internal_workflow_service)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    storage: Annotated[ObjectStorageService, Depends(get_object_storage)],
+    gemini_provider: Annotated[GeminiProvider, Depends(get_gemini_provider)],
+    worker_http_client: Annotated[httpx.AsyncClient | None, Depends(get_worker_http_client)],
+    n8n_http_client: Annotated[httpx.AsyncClient | None, Depends(get_n8n_http_client)],
     payload: ProcessDocumentRequest | None = None,
 ) -> ApiResponse[ProcessDocumentResponse]:
-    """Bundle document sources into a source_bundle_id and queue M5 processing jobs."""
+    """Bundle document sources into a source_bundle_id and queue/dispatch processing jobs."""
     data = await document_service.start_processing(
         current_user,
         document_id=document_id,
         payload=payload or ProcessDocumentRequest(),
     )
+    if settings.workflow_orchestrator_provider in ("python", "n8n"):
+        norm_job = next((job for job in data.jobs if job.job_type == "normalize"), None)
+        ai_job = next((job for job in data.jobs if job.job_type == "ai_generation"), None)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=request.app),
+            base_url="http://internal-backend",
+        ) as loopback_client:
+            if norm_job is not None and norm_job.status == "queued":
+                await internal_service.dispatch_normalize_job(
+                    job_id=norm_job.id,
+                    loopback_client=loopback_client,
+                    storage=storage,
+                    worker_http_client=worker_http_client,
+                )
+            elif (
+                ai_job is not None
+                and ai_job.status == "queued"
+                and (norm_job is None or norm_job.status == "completed")
+            ):
+                await internal_service.dispatch_ai_generation_job(
+                    job_id=ai_job.id,
+                    loopback_client=loopback_client,
+                    gemini_provider=gemini_provider,
+                    n8n_http_client=n8n_http_client,
+                )
+        data = await document_service.get_processing_snapshot(
+            document_id=document_id,
+            source_bundle_id=data.source_bundle_id,
+        )
     return ApiResponse(data=data)
 
 

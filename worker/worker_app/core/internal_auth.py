@@ -85,3 +85,35 @@ def build_worker_callback_headers(
         "X-Internal-Event-Id": event_id.strip(),
         "X-Internal-Signature": signature,
     }
+
+
+def verify_internal_request(
+    *,
+    secret: str,
+    provided_signature: str,
+    timestamp: int,
+    event_id: str,
+    method: str,
+    canonical_path: str,
+    raw_body: bytes | str = b"",
+    tolerance_seconds: int = 300,
+    now_timestamp: int | None = None,
+) -> None:
+    """Verify incoming signed internal request using constant-time digest comparison."""
+    if not provided_signature.strip():
+        raise WorkerAuthError("Missing HMAC signature")
+
+    current_ts = int(time.time()) if now_timestamp is None else now_timestamp
+    if abs(current_ts - timestamp) > tolerance_seconds:
+        raise WorkerAuthError("Request timestamp outside allowed tolerance window")
+
+    expected = sign_internal_request(
+        secret=secret,
+        timestamp=timestamp,
+        event_id=event_id,
+        method=method,
+        canonical_path=canonical_path,
+        raw_body=raw_body,
+    )
+    if not hmac.compare_digest(expected, provided_signature.strip().lower()):
+        raise WorkerAuthError("Invalid internal HMAC signature")

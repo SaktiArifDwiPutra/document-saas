@@ -339,11 +339,135 @@ export async function listDocumentVersions(
   return parseApiResponse<DocumentVersionListData>(res);
 }
 
+export interface ConflictItem {
+  field_path: string;
+  values: string[];
+  source_ids: string[];
+  description: string;
+}
+
+export interface MeetingMinutesDraftContent {
+  meeting_title: string | null;
+  meeting_date: string | null;
+  meeting_time: string | null;
+  location: string | null;
+  organizer: string | null;
+  chairperson: string | null;
+  attendees: string[];
+  absentees: string[];
+  agenda_items: string[];
+  discussion_summary: string | null;
+  opinions: Array<{
+    statement: string;
+    speaker: string | null;
+    source_id: string;
+    excerpt: string;
+  }>;
+  proposals: Array<{
+    proposal: string;
+    proposer: string | null;
+    status: "proposed" | "deferred";
+    source_id: string;
+    excerpt: string;
+  }>;
+  decisions: Array<{
+    decision: string;
+    source_id: string;
+    excerpt: string;
+  }>;
+  action_items: Array<{
+    task: string;
+    assignee: string | null;
+    due_date: string | null;
+    source_id: string;
+    excerpt: string;
+  }>;
+  field_statuses: Record<string, "grounded" | "missing" | "conflicting">;
+  conflicts: ConflictItem[];
+  provenance: Array<{
+    field_path: string;
+    source_id: string;
+    source_name: string;
+    source_type: SourceType;
+    excerpt: string;
+  }>;
+  warnings: string[];
+}
+
+export interface UsageEventItem {
+  id: string;
+  workspace_id: string;
+  user_id: string | null;
+  document_id: string | null;
+  job_id: string | null;
+  provider: string;
+  model: string;
+  workflow_key: string;
+  input_tokens: number;
+  output_tokens: number;
+  estimated_cost_minor_units: number;
+  duration_ms: number;
+  status: "completed" | "failed";
+  created_at: string;
+}
+
+export interface UsageListData {
+  items: UsageEventItem[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface UsageSummaryData {
+  workspace_id: string;
+  total_events: number;
+  completed_events: number;
+  failed_events: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_estimated_cost_minor_units: number;
+  total_duration_ms: number;
+}
+
 export async function getJobStatus(accessToken: string, jobId: string): Promise<JobData> {
   const res = await fetch(`${getApiBaseUrl()}/jobs/${encodeURIComponent(jobId)}`, {
     method: "GET",
     headers: { Authorization: `Bearer ${accessToken}` },
   });
   return parseApiResponse<JobData>(res);
+}
+
+export async function getWorkspaceUsage(
+  accessToken: string,
+  workspaceId: string,
+  page = 1,
+  pageSize = 20,
+): Promise<UsageListData> {
+  const params = new URLSearchParams({
+    page: String(page),
+    page_size: String(pageSize),
+  });
+  const res = await fetch(
+    `${getApiBaseUrl()}/workspaces/${encodeURIComponent(workspaceId)}/usage?${params.toString()}`,
+    {
+      method: "GET",
+      headers: { Authorization: `Bearer ${accessToken}` },
+    },
+  );
+  return parseApiResponse<UsageListData>(res);
+}
+
+export async function getWorkspaceUsageSummary(
+  accessToken: string,
+  workspaceId: string,
+): Promise<UsageSummaryData> {
+  const res = await fetch(
+    `${getApiBaseUrl()}/workspaces/${encodeURIComponent(workspaceId)}/usage/summary`,
+    {
+      method: "GET",
+      headers: { Authorization: `Bearer ${accessToken}` },
+    },
+  );
+  return parseApiResponse<UsageSummaryData>(res);
 }
 

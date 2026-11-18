@@ -6,9 +6,12 @@ import {
   deleteDocument,
   getDocument,
   getJobStatus,
+  getWorkspaceUsage,
+  getWorkspaceUsageSummary,
   listDocumentSources,
   listDocumentVersions,
   listWorkspaceDocuments,
+  MeetingMinutesDraftContent,
   processDocument,
   submitDocumentSource,
   updateDocument,
@@ -220,6 +223,77 @@ describe("Frontend M5 documents, sources, and jobs client", () => {
 
     const versions = await listDocumentVersions("tok-1", "doc-1");
     expect(versions.total).toBe(0);
+  });
+
+  it("fetches workspace AI usage history and summary alongside meeting_minutes draft types", async () => {
+    const sampleDraft: MeetingMinutesDraftContent = {
+      meeting_title: "Rapat M6",
+      meeting_date: "2026-11-18",
+      meeting_time: null,
+      location: "Ruang Rapat 1",
+      organizer: null,
+      chairperson: null,
+      attendees: ["Sakti"],
+      absentees: [],
+      agenda_items: ["Evaluasi M6"],
+      discussion_summary: null,
+      opinions: [{ statement: "Perlu uji tambahan", speaker: "Budi", source_id: "src-1", excerpt: "Opini: ..." }],
+      proposals: [{ proposal: "Tambah tes", proposer: "Budi", status: "proposed", source_id: "src-1", excerpt: "Usulan: ..." }],
+      decisions: [{ decision: "Lanjut rilis", source_id: "src-1", excerpt: "Keputusan: ..." }],
+      action_items: [{ task: "Kirim laporan", assignee: "Sakti", due_date: "2026-11-20", source_id: "src-1", excerpt: "Tindak lanjut: ..." }],
+      field_statuses: { meeting_title: "grounded", meeting_time: "missing" },
+      conflicts: [],
+      provenance: [],
+      warnings: [],
+    };
+    expect(sampleDraft.decisions).toHaveLength(1);
+
+    const usageList = {
+      items: [
+        {
+          id: "u-1",
+          workspace_id: "ws-1",
+          user_id: "user-1",
+          document_id: "doc-1",
+          job_id: "job-1",
+          provider: "gemini",
+          model: "gemini-2.5-flash",
+          workflow_key: "meeting_minutes_v1",
+          input_tokens: 120,
+          output_tokens: 80,
+          estimated_cost_minor_units: 0,
+          duration_ms: 420,
+          status: "completed" as const,
+          created_at: "2026-11-18T00:00:00Z",
+        },
+      ],
+      total: 1,
+      page: 1,
+      page_size: 20,
+    };
+    const usageSummary = {
+      workspace_id: "ws-1",
+      total_events: 1,
+      completed_events: 1,
+      failed_events: 0,
+      total_input_tokens: 120,
+      total_output_tokens: 80,
+      total_estimated_cost_minor_units: 0,
+      total_duration_ms: 420,
+    };
+
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonOk(usageList))
+      .mockResolvedValueOnce(jsonOk(usageSummary));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const listRes = await getWorkspaceUsage("tok-1", "ws-1", 1, 20);
+    expect(listRes.items[0].workflow_key).toBe("meeting_minutes_v1");
+
+    const sumRes = await getWorkspaceUsageSummary("tok-1", "ws-1");
+    expect(sumRes.completed_events).toBe(1);
+    expect(sumRes.total_input_tokens).toBe(120);
   });
 });
 

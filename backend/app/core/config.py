@@ -98,6 +98,20 @@ class Settings(BaseSettings):
     object_storage_endpoint: str = "https://r2.local.invalid"
     object_storage_bucket: str = "document-saas-private"
 
+    # M6 AI document engine & internal workflow orchestration settings.
+    source_bundle_ttl_seconds: int = Field(default=900, ge=60, le=3600)
+    max_callback_payload_bytes: int = Field(default=512 * 1024, ge=4096, le=5 * 1024 * 1024)
+    workflow_orchestrator_provider: Literal["none", "python", "n8n"] = "none"
+    worker_provider_mode: Literal["local", "http"] = "local"
+    worker_base_url: str = "http://localhost:8001"
+    worker_timeout_seconds: float = Field(default=30.0, ge=1.0, le=120.0)
+    n8n_base_url: str = "http://localhost:5678"
+    n8n_timeout_seconds: float = Field(default=10.0, ge=1.0, le=120.0)
+    gemini_provider_mode: Literal["deterministic", "http"] = "deterministic"
+    gemini_api_key: str | None = None
+    gemini_model: str = "gemini-2.5-flash"
+    gemini_timeout_seconds: float = Field(default=30.0, ge=1.0, le=120.0)
+
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
 
     @field_validator("api_v1_prefix")

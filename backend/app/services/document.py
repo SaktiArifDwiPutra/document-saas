@@ -978,6 +978,9 @@ class DocumentService:
             self._session.add(normalize_job)
             jobs_to_create.append(normalize_job)
 
+        ai_provider_label = (
+            "python" if self._settings.workflow_orchestrator_provider == "python" else "n8n"
+        )
         ai_job = Job(
             workspace_id=document.workspace_id,
             document_id=document.id,
@@ -986,7 +989,7 @@ class DocumentService:
             source_bundle_id=source_bundle_id,
             workflow_key=f"{document.document_type}_v1",
             workflow_version="v1",
-            workflow_provider="n8n",
+            workflow_provider=ai_provider_label,
             idempotency_key=f"ai:{run_key}",
             created_at=now,
             updated_at=now,
@@ -1092,6 +1095,49 @@ class DocumentService:
             document=_to_document_summary(refreshed_doc),
             source_bundle_id=source_bundle_id,
             jobs=[_to_job_response(job) for job in refreshed_jobs],
+            reservation_id=reservation.id if reservation else None,
+            reserved_credits=reservation.amount if reservation else 0,
+        )
+
+    async def get_processing_snapshot(
+        self,
+        *,
+        document_id: UUID,
+        source_bundle_id: UUID,
+    ) -> ProcessDocumentResponse:
+        """Reload freshly committed document, jobs, and credit reservation for a bundle."""
+        document = await self._session.scalar(
+            select(Document)
+            .where(Document.id == document_id)
+            .execution_options(populate_existing=True)
+        )
+        assert document is not None
+        bundled_jobs = (
+            await self._session.scalars(
+                select(Job)
+                .where(
+                    Job.document_id == document_id,
+                    Job.source_bundle_id == source_bundle_id,
+                )
+                .order_by(Job.created_at.asc(), Job.id.asc())
+                .execution_options(populate_existing=True)
+            )
+        ).all()
+        ai_job = next((job for job in bundled_jobs if job.job_type == "ai_generation"), None)
+        reservation: CreditReservation | None = None
+        if ai_job is not None:
+            reservation = await self._session.scalar(
+                select(CreditReservation)
+                .where(
+                    CreditReservation.workspace_id == document.workspace_id,
+                    CreditReservation.job_id == ai_job.id,
+                )
+                .execution_options(populate_existing=True)
+            )
+        return ProcessDocumentResponse(
+            document=_to_document_summary(document),
+            source_bundle_id=source_bundle_id,
+            jobs=[_to_job_response(job) for job in bundled_jobs],
             reservation_id=reservation.id if reservation else None,
             reserved_credits=reservation.amount if reservation else 0,
         )

@@ -1,9 +1,11 @@
 """Strict upload validation and archive/XML safety checks (Milestone M5)."""
 
+import contextlib
 import hashlib
 import io
 import re
 import zipfile
+import zlib
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Literal
@@ -72,6 +74,9 @@ _PDF_ACTIVE_CONTENT_RE = re.compile(
     rb"/(?:JavaScript|JS|Launch|EmbeddedFile|OpenAction|RichMedia)(?=[\s/<(\[])",
     re.IGNORECASE,
 )
+_PDF_ENCRYPT_RE = re.compile(rb"/Encrypt(?=[\s/<(\[])", re.IGNORECASE)
+_PDF_DELIMITERS = frozenset(b"()<>[]{}/%")
+_PDF_WHITESPACE = frozenset(b" \t\r\n\x00\x0c")
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _FILENAME_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -402,12 +407,324 @@ def _validate_docx_bytes(
     }
 
 
-def _validate_pdf_bytes(data: bytes) -> tuple[str, dict[str, object]]:
-    """Validate PDF magic header, EOF marker, and reject embedded JS/active actions."""
+def _read_pdf_literal_string(buf: bytes, start: int) -> tuple[str, int]:
+    """Parse a PDF (...) literal string starting at index `start`, handling escapes and nesting."""
+    out: list[str] = []
+    n = len(buf)
+    i = start + 1
+    depth = 1
+    while i < n and depth > 0:
+        b = buf[i]
+        if b == 0x5C:
+            i += 1
+            if i >= n:
+                break
+            esc = buf[i]
+            if esc == ord("n"):
+                out.append("\n")
+            elif esc == ord("r"):
+                out.append("\r")
+            elif esc == ord("t"):
+                out.append("\t")
+            elif esc == ord("b"):
+                out.append("\b")
+            elif esc == ord("f"):
+                out.append("\f")
+            elif esc in (ord("("), ord(")"), 0x5C):
+                out.append(chr(esc))
+            elif esc in (0x0A, 0x0D):
+                if esc == 0x0D and i + 1 < n and buf[i + 1] == 0x0A:
+                    i += 1
+            elif 0x30 <= esc <= 0x37:
+                oct_digits = chr(esc)
+                for _ in range(2):
+                    if i + 1 < n and 0x30 <= buf[i + 1] <= 0x37:
+                        i += 1
+                        oct_digits += chr(buf[i])
+                    else:
+                        break
+                out.append(chr(int(oct_digits, 8)))
+            else:
+                out.append(chr(esc))
+            i += 1
+        elif b == 0x28:
+            depth += 1
+            out.append("(")
+            i += 1
+        elif b == 0x29:
+            depth -= 1
+            if depth > 0:
+                out.append(")")
+            i += 1
+        else:
+            out.append(chr(b))
+            i += 1
+    return "".join(out), i
+
+
+def _read_pdf_hex_string(buf: bytes, start: int) -> tuple[str, int]:
+    """Parse a PDF <hex> string starting at `start`."""
+    end = buf.find(b">", start + 1)
+    if end == -1:
+        return "", len(buf)
+    hex_chars = re.sub(rb"\s+", b"", buf[start + 1 : end]).decode("ascii", errors="ignore")
+    if len(hex_chars) % 2 == 1:
+        hex_chars += "0"
+    try:
+        raw = bytes.fromhex(hex_chars)
+    except ValueError:
+        return "", end + 1
+    if raw.startswith(b"\xfe\xff"):
+        return raw[2:].decode("utf-16-be", errors="ignore"), end + 1
+    try:
+        return raw.decode("utf-8"), end + 1
+    except UnicodeDecodeError:
+        return raw.decode("latin-1", errors="ignore"), end + 1
+
+
+def _read_pdf_array(buf: bytes, start: int) -> tuple[list[tuple[str, str | float]], int]:
+    """Parse a PDF [...] array containing literal/hex strings and numeric kerning offsets."""
+    items: list[tuple[str, str | float]] = []
+    n = len(buf)
+    i = start + 1
+    while i < n:
+        b = buf[i]
+        if b in _PDF_WHITESPACE:
+            i += 1
+            continue
+        if b == 0x5D:
+            return items, i + 1
+        if b == 0x28:
+            text, i = _read_pdf_literal_string(buf, i)
+            items.append(("str", text))
+        elif b == 0x3C:
+            text, i = _read_pdf_hex_string(buf, i)
+            items.append(("str", text))
+        else:
+            j = i
+            while j < n and buf[j] not in _PDF_WHITESPACE and buf[j] not in _PDF_DELIMITERS:
+                j += 1
+            if j == i:
+                i += 1
+                continue
+            token = buf[i:j]
+            i = j
+            with contextlib.suppress(ValueError):
+                items.append(("num", float(token)))
+    return items, n
+
+
+def _extract_pdf_text_from_stream(stream_bytes: bytes) -> list[str]:
+    """Extract normalized lines from PDF BT..ET content operators including Tj and TJ arrays."""
+    lines: list[str] = []
+    current_parts: list[str] = []
+    operands: list[tuple[str, object]] = []
+    in_text_obj = False
+    last_tm_y: float | None = None
+
+    def flush_line() -> None:
+        nonlocal current_parts
+        if current_parts:
+            joined = "".join(current_parts)
+            cleaned = " ".join(joined.split())
+            if cleaned:
+                lines.append(cleaned)
+            current_parts = []
+
+    n = len(stream_bytes)
+    i = 0
+    while i < n:
+        b = stream_bytes[i]
+        if b in _PDF_WHITESPACE:
+            i += 1
+            continue
+        if b == 0x25:
+            nl = stream_bytes.find(b"\n", i)
+            i = n if nl == -1 else nl + 1
+            continue
+        if b == 0x28:
+            text, i = _read_pdf_literal_string(stream_bytes, i)
+            if in_text_obj:
+                operands.append(("str", text))
+            continue
+        if b == 0x5B:
+            arr_items, i = _read_pdf_array(stream_bytes, i)
+            if in_text_obj:
+                operands.append(("arr", arr_items))
+            continue
+        if b == 0x3C:
+            if i + 1 < n and stream_bytes[i + 1] == 0x3C:
+                close_dict = stream_bytes.find(b">>", i + 2)
+                i = n if close_dict == -1 else close_dict + 2
+            else:
+                text, i = _read_pdf_hex_string(stream_bytes, i)
+                if in_text_obj:
+                    operands.append(("str", text))
+            continue
+        if b == 0x2F:
+            i += 1
+            while (
+                i < n
+                and stream_bytes[i] not in _PDF_WHITESPACE
+                and stream_bytes[i] not in _PDF_DELIMITERS
+            ):
+                i += 1
+            continue
+        if b in _PDF_DELIMITERS:
+            i += 1
+            continue
+
+        j = i
+        while (
+            j < n
+            and stream_bytes[j] not in _PDF_WHITESPACE
+            and stream_bytes[j] not in _PDF_DELIMITERS
+        ):
+            j += 1
+        token = stream_bytes[i:j]
+        i = j
+
+        if token == b"BT":
+            flush_line()
+            in_text_obj = True
+            last_tm_y = None
+            operands.clear()
+            continue
+        if token == b"ET":
+            flush_line()
+            in_text_obj = False
+            last_tm_y = None
+            operands.clear()
+            continue
+        if not in_text_obj:
+            continue
+
+        if token in (b"Tj", b"'", b'"'):
+            if token in (b"'", b'"'):
+                flush_line()
+            for kind, val in reversed(operands):
+                if kind == "str" and isinstance(val, str):
+                    current_parts.append(val)
+                    break
+            operands.clear()
+        elif token == b"TJ":
+            for kind, val in reversed(operands):
+                if kind == "arr" and isinstance(val, list):
+                    for item_kind, item_val in val:
+                        if item_kind == "str" and isinstance(item_val, str):
+                            current_parts.append(item_val)
+                        elif (
+                            item_kind == "num"
+                            and isinstance(item_val, float)
+                            and item_val <= -120
+                            and current_parts
+                            and not current_parts[-1].endswith((" ", "\t"))
+                        ):
+                            current_parts.append(" ")
+                    break
+            operands.clear()
+        elif token == b"T*":
+            flush_line()
+            operands.clear()
+        elif token in (b"Td", b"TD"):
+            nums = [float(v) for k, v in operands[-2:] if k == "num" and isinstance(v, float)]
+            if len(nums) == 2:
+                tx, ty = nums
+                if abs(ty) > 0.5:
+                    flush_line()
+                elif abs(tx) > 0.5 and current_parts and not current_parts[-1].endswith(" "):
+                    current_parts.append(" ")
+            operands.clear()
+        elif token == b"Tm":
+            nums = [float(v) for k, v in operands[-6:] if k == "num" and isinstance(v, float)]
+            if len(nums) == 6:
+                tm_y = nums[5]
+                if last_tm_y is not None and abs(tm_y - last_tm_y) > 0.5:
+                    flush_line()
+                last_tm_y = tm_y
+            operands.clear()
+        else:
+            try:
+                operands.append(("num", float(token)))
+            except ValueError:
+                operands.clear()
+
+    flush_line()
+    return lines
+
+
+def _decompress_pdf_flate_stream(raw_stream: bytes, *, max_bytes: int) -> bytes:
+    """Safely decompress a FlateDecode PDF stream enforcing a strict expansion cap."""
+    for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
+        decompressor = zlib.decompressobj(wbits)
+        chunks: list[bytes] = []
+        total = 0
+        try:
+            pos = 0
+            chunk_size = 65_536
+            while pos < len(raw_stream):
+                piece = raw_stream[pos : pos + chunk_size]
+                pos += chunk_size
+                remaining = max_bytes - total
+                if remaining <= 0:
+                    raise AppError(
+                        code="UPLOAD_REJECTED",
+                        message="Rasio ekspansi stream PDF melebihi batas aman.",
+                        status_code=422,
+                    )
+                out = decompressor.decompress(piece, remaining + 1)
+                total += len(out)
+                if total > max_bytes:
+                    raise AppError(
+                        code="UPLOAD_REJECTED",
+                        message="Rasio ekspansi stream PDF melebihi batas aman.",
+                        status_code=422,
+                    )
+                if out:
+                    chunks.append(out)
+            tail = decompressor.flush(max(0, max_bytes - total + 1))
+            total += len(tail)
+            if total > max_bytes:
+                raise AppError(
+                    code="UPLOAD_REJECTED",
+                    message="Rasio ekspansi stream PDF melebihi batas aman.",
+                    status_code=422,
+                )
+            if tail:
+                chunks.append(tail)
+            return b"".join(chunks)
+        except zlib.error:
+            if wbits == zlib.MAX_WBITS:
+                continue
+            raise AppError(
+                code="UPLOAD_REJECTED",
+                message="Stream FlateDecode pada file PDF rusak atau tidak valid.",
+                status_code=422,
+            ) from None
+    raise AppError(
+        code="UPLOAD_REJECTED",
+        message="Stream FlateDecode pada file PDF rusak atau tidak valid.",
+        status_code=422,
+    )
+
+
+def _validate_pdf_bytes(
+    data: bytes,
+    *,
+    max_file_size_bytes: int,
+    max_archive_expansion_ratio: int,
+) -> tuple[str, dict[str, object]]:
+    """Validate PDF structure, FlateDecode streams, active content, and extract text."""
     if not data.startswith(b"%PDF-") or b"%%EOF" not in data[-1024:]:
         raise AppError(
             code="UPLOAD_REJECTED",
             message="File PDF rusak atau tidak memiliki penanda PDF yang valid.",
+            status_code=422,
+        )
+    if _PDF_ENCRYPT_RE.search(data):
+        raise AppError(
+            code="UPLOAD_REJECTED",
+            message="File PDF terenkripsi tidak didukung.",
             status_code=422,
         )
     if _PDF_ACTIVE_CONTENT_RE.search(data):
@@ -416,7 +733,94 @@ def _validate_pdf_bytes(data: bytes) -> tuple[str, dict[str, object]]:
             message="File PDF mengandung JavaScript atau konten aktif yang ditolak.",
             status_code=422,
         )
-    return "", {"pdf_header": data[:8].decode("ascii", errors="replace")}
+
+    max_uncompressed = max_file_size_bytes * max_archive_expansion_ratio
+    small_floor = min(_SMALL_DOCX_UNCOMPRESSED_FLOOR_BYTES, max_file_size_bytes)
+    effective_cap = min(
+        max_uncompressed,
+        max(len(data) * max_archive_expansion_ratio, small_floor),
+    )
+
+    content_buffers: list[bytes] = []
+    remaining_budget = effective_cap
+    search_pos = 0
+    saw_stream = False
+
+    while True:
+        match = re.search(rb"stream(?:\r\n|\n|\r)", data[search_pos:])
+        if match is None:
+            break
+        saw_stream = True
+        stream_kw_pos = search_pos + match.start()
+        stream_data_start = search_pos + match.end()
+        end_pos = data.find(b"endstream", stream_data_start)
+        if end_pos == -1:
+            raise AppError(
+                code="UPLOAD_REJECTED",
+                message="Blok stream PDF tidak valid.",
+                status_code=422,
+            )
+        search_pos = end_pos + len(b"endstream")
+
+        raw_stream = data[stream_data_start:end_pos]
+        if raw_stream.endswith(b"\r\n"):
+            raw_stream = raw_stream[:-2]
+        elif raw_stream.endswith((b"\n", b"\r")):
+            raw_stream = raw_stream[:-1]
+
+        dict_window = data[max(0, stream_kw_pos - 2048) : stream_kw_pos]
+        obj_pos = dict_window.rfind(b"obj")
+        dict_start = (
+            dict_window.find(b"<<", obj_pos) if obj_pos != -1 else dict_window.rfind(b"<<")
+        )
+        dict_bytes = dict_window[dict_start:] if dict_start != -1 else dict_window
+        dict_lower = dict_bytes.lower()
+
+        if b"/image" in dict_lower or b"/dctdecode" in dict_lower or b"/jpxdecode" in dict_lower:
+            continue
+
+        if b"/flatedecode" in dict_lower:
+            decoded_stream = _decompress_pdf_flate_stream(raw_stream, max_bytes=remaining_budget)
+            remaining_budget -= len(decoded_stream)
+            if _PDF_ACTIVE_CONTENT_RE.search(decoded_stream):
+                raise AppError(
+                    code="UPLOAD_REJECTED",
+                    message="File PDF mengandung JavaScript atau konten aktif yang ditolak.",
+                    status_code=422,
+                )
+            content_buffers.append(decoded_stream)
+        elif re.search(rb"/filter(?:\s|\[)", dict_lower):
+            continue
+        else:
+            if len(raw_stream) > remaining_budget:
+                raise AppError(
+                    code="UPLOAD_REJECTED",
+                    message="Rasio ekspansi stream PDF melebihi batas aman.",
+                    status_code=422,
+                )
+            remaining_budget -= len(raw_stream)
+            if _PDF_ACTIVE_CONTENT_RE.search(raw_stream):
+                raise AppError(
+                    code="UPLOAD_REJECTED",
+                    message="File PDF mengandung JavaScript atau konten aktif yang ditolak.",
+                    status_code=422,
+                )
+            content_buffers.append(raw_stream)
+
+    if not saw_stream:
+        content_buffers.append(data)
+
+    page_blocks: list[str] = []
+    for buf in content_buffers:
+        lines = _extract_pdf_text_from_stream(buf)
+        if lines:
+            page_blocks.append("\n".join(lines))
+
+    return "\n".join(page_blocks), {
+        "pdf_header": data[:8].decode("ascii", errors="replace"),
+        "stream_count": len(content_buffers),
+        "text_stream_count": len(page_blocks),
+    }
 
 
 def _validate_txt_bytes(data: bytes) -> tuple[str, dict[str, object]]:
@@ -470,7 +874,11 @@ def validate_uploaded_content(
             max_zip_entries=max_zip_entries,
         )
     elif kind == "pdf":
-        extracted_text, meta = _validate_pdf_bytes(data)
+        extracted_text, meta = _validate_pdf_bytes(
+            data,
+            max_file_size_bytes=max_file_size_bytes,
+            max_archive_expansion_ratio=max_archive_expansion_ratio,
+        )
     else:
         extracted_text, meta = _validate_txt_bytes(data)
 
