@@ -27,6 +27,8 @@ async def get_db_session() -> AsyncIterator[AsyncSession]:
     """FastAPI dependency yielding an async database session."""
     engine = create_engine()
     session_factory = create_session_factory(engine)
-    async with session_factory() as session:
-        yield session
-    await engine.dispose()
+    try:
+        async with session_factory() as session:
+            yield session
+    finally:
+        await engine.dispose()

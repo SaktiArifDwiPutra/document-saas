@@ -95,10 +95,26 @@ safe retries.
   POST                    `/auth/reset-password`    Set new password
   -------------------------------------------------------------------------
 
-Requirements: - Argon2id password hashing. - Rate limiting. - Generic
-responses for account-recovery requests to reduce enumeration. - Refresh
-token rotation and revocation. - Register transaction creates user and
-exactly one Personal Workspace.
+Requirements: - Argon2id password hashing (constant-time dummy verification
+on missing accounts and transparent rehash upgrades on login). - Dual
+per-IP and SHA-256 hashed per-account rate limiting on authentication
+recovery and login paths. - Generic responses for account-recovery
+requests to reduce enumeration. - Refresh token rotation, single-use
+consumption, and family revocation under row-level locks. - Cookie-based auth endpoints (`/auth/refresh`, `/auth/logout`) enforce `Origin` allowlist
+(with `Referer` scheme+netloc fallback when `Origin` is absent, configurable
+via `require_origin_or_referer` in non-production) plus double-submit
+`csrf_token` / `X-CSRF-Token` validation, and expire auth cookies
+(`Max-Age=0`) on `401` refresh failures. `refresh_token` is `HttpOnly` and
+scoped to `Path=/api/v1/auth`, while the readable `csrf_token` cookie uses
+`Path=/` (with matching attributes and paths on deletion) so frontend routes
+(`/`, `/login`, `/register`) can read it via `document.cookie`. Frontend
+single-flight refresh coalescing and logout/refresh generation sequencing
+coordinate concurrent calls within a single browser tab; cross-tab refresh
+coordination (e.g., `BroadcastChannel` or `navigator.locks`) is explicitly
+deferred as a known production-readiness limitation. - Register transaction creates
+user and exactly one Personal Workspace (Personal Workspace creation deferred
+to M3). - M2 uses a stub transactional email service; real email provider
+integration remains a separate task before production launch.
 
 ## 3. Workspaces
 
@@ -365,8 +381,8 @@ Never send end-user login tokens, database credentials, or wallet balances to n8
 
 ## 11. Rate Limits (Initial Targets)
 
--   Login: 5 requests/minute/IP.
--   Forgot password: 3 requests/hour/account.
+-   Login: 5 requests/minute/IP and 5 requests/5 minutes/hashed-account.
+-   Forgot password: 10 requests/hour/IP and 3 requests/hour/hashed-account.
 -   Register: 5 requests/hour/IP.
 -   AI processing: workspace quotas and concurrent job caps.
 -   Upload: size/count limits and per-user throttling.
@@ -374,6 +390,33 @@ Never send end-user login tokens, database credentials, or wallet balances to n8
 
 These are starting values and must be tuned using observed traffic and
 abuse testing.
+
+> **Operational Scope Note (M2 Dev/Beta Limiter & Proxy Trust):** The
+> bounded in-memory sliding-window rate limiter uses **independent per-scope
+> capacity pools** (`register:ip`, `login:ip`, `login:acct`, `forgot:ip`,
+> `forgot:acct`, defaulting to 10,000 keys per scope and configurable per scope),
+> SHA-256 hashed account keys, **expired/empty bucket pruning before rejecting
+> new keys**, and **safe saturation logging/metrics without raw identifiers**,
+> and is intended for **single-instance local development and single-instance
+> beta only**. Active buckets are **never evicted**; when a scope pool is
+> saturated by active keys, the limiter **fails closed with HTTP 429
+> (`RATE_LIMITED`)** for unseen keys in that scope until existing sliding
+> windows expire.
+>
+> **Availability Implications of Fail-Closed Saturation:** If a single scope
+> reaches its configured active-key capacity during a high-cardinality burst or
+> volumetric flood, new unseen callers in that scope receive HTTP 429 until
+> active buckets age out—preserving active brute-force and recovery counters at
+> the cost of temporary unavailability for unseen keys in that saturated scope.
+> Independent per-scope pools ensure cross-scope exhaustion cannot occur (for
+> example, a registration or IP flood cannot evict or exhaust account-level
+> `login:acct` or `forgot:acct` pools). Multi-instance production deployments
+> MUST replace this in-memory limiter with a shared backing store (e.g., Redis)
+> so counters and capacities remain consistent across workers/replicas.
+> Additionally, client IP extraction (`request.client.host`) assumes direct
+> connections in dev; production deployments behind a reverse proxy or CDN
+> MUST configure trusted proxy CIDR allowlists and forwarded header parsing
+> (`X-Forwarded-For` / `Forwarded`) before launch.
 
 ## 12. API Definition of Done
 

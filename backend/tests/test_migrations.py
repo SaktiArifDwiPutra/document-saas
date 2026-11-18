@@ -39,8 +39,20 @@ async def _fetch_alembic_versions(db_url: str) -> list[str]:
         await engine.dispose()
 
 
+async def _fetch_pg_tables(db_url: str) -> set[str]:
+    engine = create_async_engine(db_url)
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                text("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
+            )
+            return {str(row[0]) for row in result.fetchall()}
+    finally:
+        await engine.dispose()
+
+
 def test_alembic_baseline_upgrade_and_downgrade(tmp_path: Path) -> None:
-    """Alembic baseline migration should upgrade to head and downgrade cleanly on SQLite."""
+    """Alembic migrations should upgrade to head and downgrade cleanly on SQLite."""
     backend_dir = Path(__file__).resolve().parents[1]
     db_path = tmp_path / "alembic_test.sqlite"
     async_url = f"sqlite+aiosqlite:///{db_path}"
@@ -50,14 +62,14 @@ def test_alembic_baseline_upgrade_and_downgrade(tmp_path: Path) -> None:
     alembic_cfg.set_main_option("sqlalchemy.url", async_url)
 
     script_dir = ScriptDirectory.from_config(alembic_cfg)
-    assert script_dir.get_heads() == ["0001_m1_foundation_baseline"]
+    assert script_dir.get_heads() == ["0002_m2_auth_identity_sessions"]
 
     command.upgrade(alembic_cfg, "head")
 
     sync_engine = create_engine(sync_url)
     with sync_engine.connect() as conn:
-        tables = inspect(conn).get_table_names()
-        assert "alembic_version" in tables
+        tables = set(inspect(conn).get_table_names())
+        assert {"alembic_version", "users", "auth_sessions", "auth_action_tokens"}.issubset(tables)
     sync_engine.dispose()
 
     command.downgrade(alembic_cfg, "base")
@@ -107,10 +119,18 @@ def test_alembic_baseline_upgrade_and_downgrade_postgresql(tmp_path: Path) -> No
         alembic_cfg.set_main_option("sqlalchemy.url", test_db_url)
 
         command.upgrade(alembic_cfg, "head")
-        assert asyncio.run(_fetch_alembic_versions(test_db_url)) == ["0001_m1_foundation_baseline"]
+        assert asyncio.run(_fetch_alembic_versions(test_db_url)) == [
+            "0002_m2_auth_identity_sessions"
+        ]
+        pg_tables = asyncio.run(_fetch_pg_tables(test_db_url))
+        assert {"alembic_version", "users", "auth_sessions", "auth_action_tokens"}.issubset(
+            pg_tables
+        )
 
         command.downgrade(alembic_cfg, "base")
         assert asyncio.run(_fetch_alembic_versions(test_db_url)) == []
+        pg_tables_after = asyncio.run(_fetch_pg_tables(test_db_url))
+        assert {"users", "auth_sessions", "auth_action_tokens"}.isdisjoint(pg_tables_after)
     finally:
         subprocess.run(
             [str(pg_ctl_bin), "-D", str(pg_data), "stop", "-m", "immediate"],

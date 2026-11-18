@@ -1,3 +1,5 @@
+import Link from "next/link";
+
 import { getApiBaseUrl } from "@/lib/config";
 
 export default function HomePage() {
@@ -10,7 +12,7 @@ export default function HomePage() {
         className="rounded-lg border border-slate-200 bg-white p-8 shadow-sm"
       >
         <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-          Milestone M1 — Fondasi
+          Milestone M2 — Autentikasi &amp; Fondasi
         </p>
         <h1
           id="foundation-heading"
@@ -33,6 +35,21 @@ export default function HomePage() {
             <dd className="mt-1 truncate font-mono text-slate-900">{apiBaseUrl}</dd>
           </div>
         </dl>
+
+        <div className="mt-6 flex flex-wrap gap-3 border-t border-slate-100 pt-6">
+          <Link
+            href="/login"
+            className="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800"
+          >
+            Masuk
+          </Link>
+          <Link
+            href="/register"
+            className="rounded-md border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
+          >
+            Daftar Akun
+          </Link>
+        </div>
       </section>
     </main>
   );

@@ -57,13 +57,16 @@ organization members according to role.
 
 ### 3.1 Authentication
 
--   Registration creates user and Personal Workspace.
+-   Registration creates user and Personal Workspace (Personal Workspace creation deferred to M3).
 -   Duplicate normalized email rejected.
--   Password hash is not plaintext.
--   Login rate limit.
--   Email verification behavior.
--   Refresh rotation.
--   Logout revokes session.
+-   Password hash is not plaintext; Argon2id constant-time dummy verification runs on nonexistent accounts and outdated hashes rehash transparently on login.
+-   Dual per-IP and SHA-256 hashed per-account rate limiting (plus independent per-scope capacity pools, expired-bucket pruning before rejection, non-eviction of active buckets, fail-closed HTTP 429 saturation behavior and availability trade-offs, and PII-free saturation logging/metrics), noting in-memory scope is single-instance dev/beta only.
+-   Email verification and password reset single-use enforcement, expiry, cross-type isolation, and prior-token supersession.
+-   Refresh rotation, family reuse detection, expired/disabled-account rejection, and `Max-Age=0` cookie clearing on `401` refresh failures.
+-   Frontend single-flight `/auth/refresh` coalescing, logout/refresh generation coordination, and latest `csrf_token` cookie resolution across concurrent and sequential refreshes (single-tab scope; multi-tab coordination deferred as a known production-readiness limitation).
+-   Cookie-endpoint `Origin` / `Referer` allowlist, double-submit CSRF enforcement, and cookie attribute/path consistency (`refresh_token` `HttpOnly` on `/api/v1/auth`; readable `csrf_token` on `/`) on creation and deletion.
+-   PostgreSQL concurrency tests (`SELECT ... FOR UPDATE` and atomic conditional updates) for concurrent `/auth/refresh`, `/auth/reset-password`, and `/auth/verify-email`.
+-   Logout revokes session and enforces Origin/Referer + CSRF checks.
 -   Password reset invalidates appropriate sessions.
 
 ### 3.2 Workspace and Organization Document Permissions
